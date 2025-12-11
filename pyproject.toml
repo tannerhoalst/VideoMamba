@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "videomamba"
+version = "0.1.0"
+description = "Multi-modality video understanding models and training scripts built around VideoMamba."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "timm>=0.9",
+    "transformers>=4.30",
+    "tqdm>=4.64",
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "scipy>=1.10",
+    "omegaconf>=2.3",
+    "einops>=0.6",
+    "decord>=0.6",
+    "av>=10.0",
+    "opencv-python>=4.7",
+    "Pillow>=9.0",
+    "regex>=2023.0.0",
+    "ftfy>=6.1",
+    "pyyaml>=6.0",
+    "imageio>=2.30",
+    "termcolor>=2.0",
+    "fvcore>=0.1.5",
+    "deepspeed>=0.9",
+    "wandb>=0.15",
+    "xformers>=0.0.22",
+    "mamba-ssm>=1.1.1",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "apex @ git+https://github.com/NVIDIA/apex",
+]
+storage = [
+    "petrel-oss-sdk>=2.0",
+]
+tf = [
+    "tensorflow>=2.11",
+]
+dev = [
+    "pytest",
+    "black",
+    "isort",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+namespaces = true
+include = ["dataset*", "models*", "tasks*", "utils*", "configs*"]
+
+[tool.setuptools.package-data]
+"models.backbones.clip" = ["bpe_simple_vocab_16e6.txt.gz"]
+"configs" = ["*.json"]
