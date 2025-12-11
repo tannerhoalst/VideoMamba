@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "videomamba"
+name = "video-mamba"
 version = "0.1.0"
 description = "Multi-modality video understanding models and training scripts built around VideoMamba."
 readme = "README.md"
