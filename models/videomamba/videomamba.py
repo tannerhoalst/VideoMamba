@@ -18,7 +18,7 @@ from timm.models.vision_transformer import _load_weights
 
 import math
 
-from mamba_ssm.modules.mamba_simple import Mamba
+from .mamba_simple import Mamba
 
 try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
@@ -59,7 +59,7 @@ class Block(nn.Module):
 
     def forward(
         self, hidden_states: Tensor, residual: Optional[Tensor] = None, inference_params=None,
-        use_checkpoint=False
+        use_checkpoint=False, ssm_state: Optional[Tensor] = None
     ):
         r"""Pass the input through the encoder layer.
 
@@ -84,9 +84,13 @@ class Block(nn.Module):
                 eps=self.norm.eps,
             )
         if use_checkpoint:
-            hidden_states = checkpoint.checkpoint(self.mixer, hidden_states, inference_params)
+            hidden_states = checkpoint.checkpoint(
+                self.mixer, hidden_states, inference_params, ssm_state
+            )
         else:
-            hidden_states = self.mixer(hidden_states, inference_params=inference_params)
+            hidden_states = self.mixer(
+                hidden_states, inference_params=inference_params, ssm_state=ssm_state
+            )
         return hidden_states, residual
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
@@ -356,6 +360,18 @@ class PretrainVideoMamba(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
+    def init_ssm_state(self, batch_size, dtype=None, device=None, as_dict=False):
+        states = {} if as_dict else []
+        for idx, layer in enumerate(self.layers):
+            _, layer_state = layer.allocate_inference_cache(batch_size, max_seqlen=1, dtype=dtype)
+            if device is not None:
+                layer_state = layer_state.to(device=device)
+            if as_dict:
+                states[idx] = layer_state
+            else:
+                states.append(layer_state)
+        return states
+
     @torch.jit.ignore
     def no_weight_decay(self):
         return {"pos_embed", "cls_token"}
@@ -367,7 +383,22 @@ class PretrainVideoMamba(nn.Module):
     def load_pretrained(self, checkpoint_path, prefix=""):
         _load_weights(self, checkpoint_path, prefix)
 
-    def forward_features(self, x, mask=None, use_image=False):
+    def _get_layer_ssm_state(self, ssm_state, layer_idx):
+        if ssm_state is None:
+            return None
+        if isinstance(ssm_state, dict):
+            layer_state = ssm_state.get(layer_idx)
+            if isinstance(layer_state, (list, tuple)) and len(layer_state) == 2:
+                return layer_state[1]
+            return layer_state
+        if isinstance(ssm_state, (list, tuple)):
+            layer_state = ssm_state[layer_idx]
+            if isinstance(layer_state, (list, tuple)) and len(layer_state) == 2:
+                return layer_state[1]
+            return layer_state
+        raise TypeError("ssm_state must be a list, tuple, or dict indexed by layer id")
+
+    def forward_features(self, x, mask=None, use_image=False, ssm_state=None):
         x = self.patch_embed(x)
         B, C, T, H, W = x.shape
         x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
@@ -396,14 +427,15 @@ class PretrainVideoMamba(nn.Module):
         residual = None
         hidden_states = x_vis
         for idx, layer in enumerate(self.layers):
+            layer_ssm_state = self._get_layer_ssm_state(ssm_state, idx)
             if self.use_checkpoint and idx < self.checkpoint_num:
                 hidden_states, residual = layer(
                     hidden_states, residual, inference_params=None,
-                    use_checkpoint=True
+                    use_checkpoint=True, ssm_state=layer_ssm_state
                 )
             else:
                 hidden_states, residual = layer(
-                    hidden_states, residual, inference_params=None
+                    hidden_states, residual, inference_params=None, ssm_state=layer_ssm_state
                 )
             if (idx - 1) in self.return_index:
                 x_clip_vis.append(self.norm(residual.to(dtype=self.norm.weight.dtype))) # share norm for mask
@@ -433,11 +465,17 @@ class PretrainVideoMamba(nn.Module):
         x_vis = hidden_states
         x_clip_vis = torch.stack(x_clip_vis)
 
-        return x_vis, x_clip_vis
+        if ssm_state is None:
+            return x_vis, x_clip_vis
+        return x_vis, x_clip_vis, ssm_state
 
-    def forward(self, x, mask=None, use_image=False, keep_temporal=False):
+    def forward(self, x, mask=None, use_image=False, keep_temporal=False, ssm_state=None):
         T = x.shape[2]
-        x_vis, x_clip_vis = self.forward_features(x, mask, use_image)  # [B, N_vis, C_e]
+        features = self.forward_features(x, mask, use_image, ssm_state=ssm_state)  # [B, N_vis, C_e]
+        if ssm_state is None:
+            x_vis, x_clip_vis = features
+        else:
+            x_vis, x_clip_vis, ssm_state = features
         
         # align CLIP:
         if mask is not None and len(x_clip_vis) > 0:
@@ -461,10 +499,10 @@ class PretrainVideoMamba(nn.Module):
             if self.pool_type == "cls": # only return cls token
                 x_pool_vis = self.pool_norm(x_vis_cls)
             else:
-                if keep_temporal:
-                    B, _, C_CLIP = x_vis.shape
-                    if self.pool_type == "cls+avg":
-                        x_pool_vis = self.pool_norm(x_vis_cls + x_vis.view(B, T, -1, C_CLIP).mean(2))  
+            if keep_temporal:
+                B, _, C_CLIP = x_vis.shape
+                if self.pool_type == "cls+avg":
+                    x_pool_vis = self.pool_norm(x_vis_cls + x_vis.view(B, T, -1, C_CLIP).mean(2))  
                     elif self.pool_type == "cls_cat_avg":
                         x_pool_vis = self.pool_norm(torch.cat([x_vis_cls + x_vis.view(B, T, -1, C_CLIP).mean(2)], dim=1))
                     elif self.pool_type == "avg":
@@ -477,9 +515,13 @@ class PretrainVideoMamba(nn.Module):
                     elif self.pool_type == "avg":
                         x_pool_vis = self.pool_norm(x_vis.mean(1, keepdim=True))
             
-            return x_vis, x_pool_vis, x_clip
+            if ssm_state is None:
+                return x_vis, x_pool_vis, x_clip
+            return x_vis, x_pool_vis, x_clip, ssm_state
         else:
-            return x_vis, x_clip
+            if ssm_state is None:
+                return x_vis, x_clip
+            return x_vis, x_clip, ssm_state
 
 
 def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
