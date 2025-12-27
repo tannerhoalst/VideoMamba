@@ -27,6 +27,7 @@ config = SimpleNamespace(
         patch_size=16,
         depth=24,
         embed_dim=192,
+        channels=3,
         drop_path_rate=0.0,
         ssm_cfg=None,
         norm_epsilon=1e-5,

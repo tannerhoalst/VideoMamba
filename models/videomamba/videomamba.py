@@ -263,9 +263,11 @@ class PretrainVideoMamba(nn.Module):
             clip_return_layer=1,
             clip_student_return_interval=1,
             add_pool_norm=True,
+            in_chans=None,
         ):
         factory_kwargs = {"device": device, "dtype": dtype} # follow MambaLMHeadModel
         super().__init__()
+        input_channels = channels if in_chans is None else in_chans
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
         self.use_checkpoint = use_checkpoint
@@ -286,7 +288,7 @@ class PretrainVideoMamba(nn.Module):
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, 
             kernel_size=kernel_size,
-            in_chans=channels, embed_dim=embed_dim
+            in_chans=input_channels, embed_dim=embed_dim
         )
         num_patches = self.patch_embed.num_patches
 
@@ -575,11 +577,17 @@ def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
 
 
 def build_videomamba(config, add_pool_norm=True):
+    channels = getattr(config.vision_encoder, "channels", None)
+    if channels is None:
+        channels = getattr(config.vision_encoder, "in_chans", None)
+    if channels is None:
+        channels = 3
     model = PretrainVideoMamba(
         img_size=config.vision_encoder.img_size, 
         patch_size=config.vision_encoder.patch_size, 
         depth=config.vision_encoder.depth, 
         embed_dim=config.vision_encoder.embed_dim, 
+        in_chans=channels,
         drop_path_rate=config.vision_encoder.drop_path_rate, 
         ssm_cfg=config.vision_encoder.ssm_cfg,
         norm_epsilon=config.vision_encoder.norm_epsilon,
@@ -631,6 +639,7 @@ if __name__ == '__main__':
             "patch_size": 16, 
             "depth": 32, 
             "embed_dim": 576, 
+            "channels": 3,
             "drop_path_rate": 0.,
             "ssm_cfg": None, 
             "norm_epsilon": 1e-5, 
@@ -651,9 +660,10 @@ if __name__ == '__main__':
         }
     }
     from easydict import EasyDict
+    channels = config['vision_encoder'].get('channels', 3)
     model = build_videomamba(EasyDict(config)).cuda()
 
-    # flops = FlopCountAnalysis(model, torch.rand(1, 3, num_frames, 224, 224))
+    # flops = FlopCountAnalysis(model, torch.rand(1, channels, num_frames, 224, 224))
     # s = time.time()
     # logger.info(flop_count_table(flops, max_depth=1))
     # logger.info(time.time()-s)
@@ -662,4 +672,4 @@ if __name__ == '__main__':
         torch.zeros(1, num_frames * 14 * 14 + 1 - mask_token),
         torch.ones(1, mask_token),
     ], dim=-1).to(torch.bool).cuda()
-    logger.info(model(torch.rand(1, 3, num_frames, 224, 224).cuda(), mask)[1].shape)
+    logger.info(model(torch.rand(1, channels, num_frames, 224, 224).cuda(), mask)[1].shape)
