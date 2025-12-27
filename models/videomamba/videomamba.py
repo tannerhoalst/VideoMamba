@@ -499,10 +499,10 @@ class PretrainVideoMamba(nn.Module):
             if self.pool_type == "cls": # only return cls token
                 x_pool_vis = self.pool_norm(x_vis_cls)
             else:
-            if keep_temporal:
-                B, _, C_CLIP = x_vis.shape
-                if self.pool_type == "cls+avg":
-                    x_pool_vis = self.pool_norm(x_vis_cls + x_vis.view(B, T, -1, C_CLIP).mean(2))  
+                if keep_temporal:
+                    B, _, C_CLIP = x_vis.shape
+                    if self.pool_type == "cls+avg":
+                        x_pool_vis = self.pool_norm(x_vis_cls + x_vis.view(B, T, -1, C_CLIP).mean(2))
                     elif self.pool_type == "cls_cat_avg":
                         x_pool_vis = self.pool_norm(torch.cat([x_vis_cls + x_vis.view(B, T, -1, C_CLIP).mean(2)], dim=1))
                     elif self.pool_type == "avg":
