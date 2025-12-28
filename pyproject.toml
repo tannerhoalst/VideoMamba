@@ -14,13 +14,11 @@ dependencies = [
     "numpy>=2.4.0",
     "einops>=0.6",
     "mamba-ssm @ git+https://github.com/state-spaces/mamba",
-    "causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d"
+    "causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d",
+    "apex @ git+https://github.com/NVIDIA/apex"
 ]
 
 [project.optional-dependencies]
-cuda = [
-    "apex @ git+https://github.com/NVIDIA/apex",
-]
 training = [
     "pyyaml>=6.0",
     "scipy>=1.16.3",
