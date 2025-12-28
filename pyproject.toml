@@ -39,3 +39,7 @@ include-package-data = true
 [tool.setuptools.packages.find]
 namespaces = true
 include = ["models*", "utils*"]
+
+[tool.isort]
+profile = "black"
+line_length = 88

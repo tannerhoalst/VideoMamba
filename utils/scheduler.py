@@ -1,27 +1,33 @@
-""" Scheduler Factory
+"""Scheduler Factory
 Hacked together by / Copyright 2020 Ross Wightman
 """
-from torch.optim import Optimizer
+
 import math
+
+from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 
 
 def create_scheduler(args, optimizer):
     lr_scheduler = None
-    if args.sched == 'cosine':
+    if args.sched == "cosine":
         lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=args.num_warmup_steps,
             num_training_steps=args.num_training_steps,
             num_cycles=0.5,
-            min_lr_multi=args.min_lr_multi
+            min_lr_multi=args.min_lr_multi,
         )
     return lr_scheduler
 
 
 def get_cosine_schedule_with_warmup(
-        optimizer: Optimizer, num_warmup_steps: int, num_training_steps: int,
-        num_cycles: float = 0.5, min_lr_multi: float = 0., last_epoch: int = -1
+    optimizer: Optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_cycles: float = 0.5,
+    min_lr_multi: float = 0.0,
+    last_epoch: int = -1,
 ):
     """
     Modified from https://github.com/huggingface/transformers/blob/v4.15.0/src/transformers/optimization.py
@@ -49,8 +55,15 @@ def get_cosine_schedule_with_warmup(
 
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
-            return max(min_lr_multi, float(current_step) / float(max(1, num_warmup_steps)))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        return max(min_lr_multi, 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)))
+            return max(
+                min_lr_multi, float(current_step) / float(max(1, num_warmup_steps))
+            )
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        return max(
+            min_lr_multi,
+            0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)),
+        )
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)

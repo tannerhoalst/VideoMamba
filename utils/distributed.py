@@ -1,9 +1,9 @@
+import logging
 import os
+
+import deepspeed
 import torch
 import torch.distributed as dist
-import logging
-import deepspeed
-
 
 logger = logging.getLogger(__name__)
 
@@ -57,23 +57,25 @@ def save_on_master(*args, **kwargs):
 
 def is_port_in_use(port):
     import socket
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(('localhost', port)) == 0
+        return s.connect_ex(("localhost", port)) == 0
 
 
 def init_distributed_mode(args):
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         # job started by torch.distributed.launch
         args.rank = int(os.environ["RANK"])
-        args.world_size = int(os.environ['WORLD_SIZE'])
-        args.gpu = int(os.environ['LOCAL_RANK'])
-    elif 'SLURM_PROCID' in os.environ:
+        args.world_size = int(os.environ["WORLD_SIZE"])
+        args.gpu = int(os.environ["LOCAL_RANK"])
+    elif "SLURM_PROCID" in os.environ:
         # local rank on the current node / global rank
-        local_rank = int(os.environ['SLURM_LOCALID'])
-        global_rank = int(os.environ['SLURM_PROCID'])
+        local_rank = int(os.environ["SLURM_LOCALID"])
+        global_rank = int(os.environ["SLURM_PROCID"])
         # number of processes / GPUs per node
-        world_size = int(os.environ["SLURM_NNODES"]) * \
-            int(os.environ["SLURM_TASKS_PER_NODE"][0])
+        world_size = int(os.environ["SLURM_NNODES"]) * int(
+            os.environ["SLURM_TASKS_PER_NODE"][0]
+        )
 
         print(world_size)
 
@@ -81,14 +83,14 @@ def init_distributed_mode(args):
         args.gpu = local_rank
         args.world_size = world_size
     else:
-        logger.info('Not using distributed mode')
+        logger.info("Not using distributed mode")
         args.distributed = False
         return
 
     args.distributed = True
 
     torch.cuda.set_device(args.gpu)
-    args.dist_backend = 'nccl'
+    args.dist_backend = "nccl"
 
     if "tcp" in args.dist_url:  # in slurm, multiple program runs in a single node
         dist_port = int(args.dist_url.split(":")[-1])
@@ -96,21 +98,25 @@ def init_distributed_mode(args):
             dist_port += 10
         args.dist_url = ":".join(args.dist_url.split(":")[:-1] + [str(dist_port)])
 
-    logger.info('| distributed init (rank {}): {}'.format(
-        args.rank, args.dist_url))
+    logger.info("| distributed init (rank {}): {}".format(args.rank, args.dist_url))
     if "SLURM_JOB_ID" in os.environ:
         logger.info(f"SLURM_JOB_ID {os.environ['SLURM_JOB_ID']}")
 
     if hasattr(args, "deepspeed") and args.deepspeed.enable:
         deepspeed.init_distributed(
-            dist_backend=args.dist_backend, init_method=args.dist_url,
-            world_size=args.world_size, rank=args.rank
+            dist_backend=args.dist_backend,
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=args.rank,
         )
     else:
         torch.distributed.init_process_group(
-            backend=args.dist_backend, init_method=args.dist_url,
-            world_size=args.world_size, rank=args.rank)
-        
+            backend=args.dist_backend,
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=args.rank,
+        )
+
     torch.distributed.barrier()
     setup_for_distributed(args.rank == 0)
 

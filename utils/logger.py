@@ -6,12 +6,13 @@ import logging
 import os
 import sys
 import time
-import wandb
 from typing import Any, Dict, Union
 
 import torch
-from .distributed import get_rank, is_main_process
+import wandb
 from termcolor import colored
+
+from .distributed import get_rank, is_main_process
 
 
 def log_dict_to_wandb(log_dict, step, prefix=""):
@@ -32,7 +33,7 @@ def setup_wandb(config):
         project=config.wandb.project,
         entity=config.wandb.entity,
         name=os.path.basename(config.output_dir),
-        reinit=True
+        reinit=True,
     )
     return run
 

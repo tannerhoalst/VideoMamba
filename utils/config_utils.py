@@ -1,9 +1,10 @@
+import json
 import logging
 import os
 import sys
-import json
-import torch.distributed as dist
 from os.path import dirname, join
+
+import torch.distributed as dist
 
 from utils.config import Config
 from utils.distributed import init_distributed_mode, is_main_process
@@ -56,12 +57,10 @@ def setup_deepspeed_zero_config(stage):
             "reduce_scatter": True,
             "reduce_bucket_size": 5e8,
             "allgather_bucket_size": 5e8,
-            "offload_optimizer": {
-                "device": "cpu"
-            },
+            "offload_optimizer": {"device": "cpu"},
         }
         # return {
-        #     "stage": 2, 
+        #     "stage": 2,
         #     "contiguous_gradients": True,
         #     "overlap_comm": True,
         #     "reduce_scatter": True,
@@ -79,12 +78,8 @@ def setup_deepspeed_zero_config(stage):
             "stage3_param_persistence_threshold": 1e5,
             "reduce_bucket_size": 1e7,
             "sub_group_size": 1e9,
-            "offload_optimizer": {
-                "device": "cpu"
-            },
-            "offload_param": {
-                "device": "cpu"
-            }
+            "offload_optimizer": {"device": "cpu"},
+            "offload_param": {"device": "cpu"},
         }
         # return {
         #     "stage": 3,
@@ -97,17 +92,17 @@ def setup_deepspeed_zero_config(stage):
         #     "stage3_max_live_parameters": 1e5,
         #     "stage3_max_reuse_distance": 1e5,
         # }
-    
+
     raise ValueError("Wrong stage for deepspeed {}".format(stage.stage))
 
 
 def setup_deepspeed_config(config):
     config.deepspeed_config = os.path.join(config.output_dir, "deepspeed_config.json")
     opts = config.optimizer
-    logger.info(f'Write deepspeed config to {config.deepspeed_config}')
+    logger.info(f"Write deepspeed config to {config.deepspeed_config}")
     if not is_main_process():
         return config
-    
+
     os.makedirs(config.output_dir, exist_ok=True)
 
     with open(config.deepspeed_config, mode="w") as writer:
@@ -126,18 +121,18 @@ def setup_deepspeed_config(config):
                         opts.opt_betas[0],
                         opts.opt_betas[1],
                     ],
-                    "eps": 1e-8
-                }
-            }
+                    "eps": 1e-8,
+                },
+            },
         }
         if config.deepspeed.stage != 0:
-            ds_config["zero_optimization"] = setup_deepspeed_zero_config(config.deepspeed.stage)
+            ds_config["zero_optimization"] = setup_deepspeed_zero_config(
+                config.deepspeed.stage
+            )
 
         if config.fp16:
-            if config.get('bf16', True):
-                ds_config["bf16"] = {
-                    "enabled": True
-                }
+            if config.get("bf16", True):
+                ds_config["bf16"] = {"enabled": True}
             else:
                 ds_config["fp16"] = {
                     "enabled": True,
@@ -147,16 +142,18 @@ def setup_deepspeed_config(config):
                     "loss_scale_window": 1000,
                     "hysteresis": 2,
                     "consecutive_hysteresis": False,
-                    "min_loss_scale": 1
-                } 
+                    "min_loss_scale": 1,
+                }
         else:
-            assert config.deepspeed.stage == 0, "You must use fp16 or bf16 when using ZERO!!!"
-            
+            assert (
+                config.deepspeed.stage == 0
+            ), "You must use fp16 or bf16 when using ZERO!!!"
+
         if config.get("max_grad_norm", -1) > 0:
             ds_config.update({"gradient_clipping", config.max_grad_norm})
 
         writer.write(json.dumps(ds_config, indent=2))
-    
+
     return config
 
 
