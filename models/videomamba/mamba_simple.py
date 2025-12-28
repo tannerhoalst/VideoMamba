@@ -138,19 +138,26 @@ def _selective_scan_with_state(
             initial_state=initial_state,
             return_last_state=return_last_state,
         )
-    return _selective_scan_ref(
-        x,
-        dt,
-        A,
-        B,
-        C,
-        D=D,
-        z=z,
-        delta_bias=delta_bias,
-        delta_softplus=delta_softplus,
-        initial_state=initial_state,
-        return_last_state=return_last_state,
-    )
+    if initial_state.stride(-1) != 1:
+        initial_state = initial_state.contiguous()
+    batch, dim, seqlen = x.shape
+    out = torch.empty((batch, dim, seqlen), device=x.device, dtype=x.dtype)
+    state = initial_state
+    for i in range(seqlen):
+        z_i = z[:, :, i] if z is not None else None
+        out[:, :, i] = selective_state_update(
+            state,
+            x[:, :, i],
+            dt[:, :, i],
+            A,
+            B[:, :, i],
+            C[:, :, i],
+            D,
+            z=z_i,
+            dt_bias=delta_bias,
+            dt_softplus=delta_softplus,
+        )
+    return out if not return_last_state else (out, state)
 
 
 class Mamba(nn.Module):
