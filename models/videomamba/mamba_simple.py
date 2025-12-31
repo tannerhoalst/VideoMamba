@@ -2,7 +2,7 @@
 
 import inspect
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -258,16 +258,35 @@ class Mamba(nn.Module):
         )
 
     def forward(
-        self, hidden_states, inference_params=None, ssm_state: Optional[Tensor] = None
+        self,
+        hidden_states,
+        inference_params=None,
+        ssm_state: Optional[Tensor] = None,
+        state: Optional[Tuple[Tensor, Tensor]] = None,
+        return_state: bool = False,
     ):
         """
         hidden_states: (B, L, D)
-        Returns: same shape as hidden_states
+        Returns: same shape as hidden_states unless return_state=True.
+
+        Args:
+            state: Optional tuple (conv_state, ssm_state) for streaming training when
+                inference_params is None.
+            return_state: Whether to return the updated (conv_state, ssm_state).
         """
+        if state is not None and ssm_state is not None:
+            raise ValueError("Pass either state or ssm_state, not both.")
+        if inference_params is not None and state is not None:
+            raise ValueError("state is not supported with inference_params.")
+
         batch, seqlen, dim = hidden_states.shape
 
         conv_state = None
-        if inference_params is not None:
+        if state is not None:
+            conv_state, ssm_state = state
+
+        use_inference_params = inference_params is not None
+        if use_inference_params:
             conv_state, cache_state = self._get_states_from_cache(
                 inference_params, batch
             )
@@ -277,6 +296,8 @@ class Mamba(nn.Module):
                 # The states are updated inplace
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
+            # Preserve inference cache behavior; ignore return_state in this path.
+            return_state = False
 
         # We do matmul and transpose BLH -> HBL at the same time
         xz = rearrange(
@@ -289,7 +310,13 @@ class Mamba(nn.Module):
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
-        if self.use_fast_path and inference_params is None and ssm_state is None:
+        if (
+            self.use_fast_path
+            and not use_inference_params
+            and ssm_state is None
+            and conv_state is None
+            and not return_state
+        ):
             out = mamba_inner_fn(
                 xz,
                 self.conv1d.weight,
@@ -307,20 +334,38 @@ class Mamba(nn.Module):
             )
         else:
             x, z = xz.chunk(2, dim=1)
+            x_in = x
             # Compute short convolution
-            if conv_state is not None:
+            if use_inference_params:
                 # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                 conv_state.copy_(
-                    F.pad(x, (self.d_conv - x.shape[-1], 0))
+                    F.pad(x_in, (self.d_conv - x_in.shape[-1], 0))
                 )  # Update state (B D W)
             assert self.activation in ["silu", "swish"]
-            x = causal_conv1d_fn(
-                x=x,
-                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                bias=self.conv1d.bias,
-                activation=self.activation,
-            )
+            new_conv_state = None
+            if conv_state is not None and not use_inference_params:
+                x_cat = torch.cat([conv_state, x_in], dim=-1)
+                x = causal_conv1d_fn(
+                    x=x_cat,
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                )
+                x = x[..., -seqlen:]
+                if return_state:
+                    new_conv_state = x_cat[..., -self.d_conv :]
+            else:
+                x = causal_conv1d_fn(
+                    x=x_in,
+                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                )
+                if return_state:
+                    new_conv_state = F.pad(
+                        x_in, (self.d_conv - x_in.shape[-1], 0)
+                    )
 
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
@@ -334,7 +379,11 @@ class Mamba(nn.Module):
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
-            return_last_state = ssm_state is not None
+            new_ssm_state = None
+            use_inplace_ssm = use_inference_params or (
+                ssm_state is not None and state is None and not return_state
+            )
+            return_last_state = return_state or use_inplace_ssm
             y = _selective_scan_with_state(
                 x,
                 dt,
@@ -350,9 +399,14 @@ class Mamba(nn.Module):
             )
             if return_last_state:
                 y, last_state = y
-                ssm_state.copy_(last_state)
+                if use_inplace_ssm:
+                    ssm_state.copy_(last_state)
+                else:
+                    new_ssm_state = last_state
             y = rearrange(y, "b d l -> b l d")
             out = self.out_proj(y)
+        if return_state:
+            return out, (new_conv_state, new_ssm_state)
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):
@@ -409,6 +463,28 @@ class Mamba(nn.Module):
         ssm_state = torch.zeros(
             batch_size,
             self.d_model * self.expand,
+            self.d_state,
+            device=device,
+            dtype=ssm_dtype,
+        )
+        return conv_state, ssm_state
+
+    def allocate_state(self, batch_size, dtype=None, device=None):
+        """Allocate zero (conv_state, ssm_state) for streaming training."""
+        if device is None:
+            device = self.out_proj.weight.device
+        conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
+        conv_state = torch.zeros(
+            batch_size,
+            self.d_inner,
+            self.d_conv,
+            device=device,
+            dtype=conv_dtype,
+        )
+        ssm_dtype = self.dt_proj.weight.dtype if dtype is None else dtype
+        ssm_state = torch.zeros(
+            batch_size,
+            self.d_inner,
             self.d_state,
             device=device,
             dtype=ssm_dtype,
