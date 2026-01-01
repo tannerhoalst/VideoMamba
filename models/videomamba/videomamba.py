@@ -469,7 +469,34 @@ class PretrainVideoMamba(nn.Module):
             return state[layer_idx]
         raise TypeError("state must be a list, tuple, or dict indexed by layer id")
 
-    def forward_features(self, x, mask=None, use_image=False, ssm_state=None):
+    def _get_temporal_pos_embedding(self, seqlen, offset=0, dtype=None, device=None):
+        """Return temporal positional embeddings for a slice starting at offset."""
+        if offset < 0:
+            raise ValueError("temporal_pos_offset must be non-negative.")
+        if device is None:
+            device = self.temporal_pos_embedding.device
+        if dtype is None:
+            dtype = self.temporal_pos_embedding.dtype
+        pos_embed = self.temporal_pos_embedding.to(device=device, dtype=dtype)
+        pos_len = pos_embed.shape[1]
+        end = offset + seqlen
+        if end <= pos_len:
+            return pos_embed[:, offset:end]
+        pos = pos_embed.permute(0, 2, 1)
+        pos = torch.nn.functional.interpolate(
+            pos.float(), size=end, mode="linear", align_corners=False
+        )
+        pos = pos.permute(0, 2, 1).to(dtype=dtype)
+        return pos[:, offset:end]
+
+    def forward_features(
+        self, x, mask=None, use_image=False, ssm_state=None, temporal_pos_offset=0
+    ):
+        """Forward features with temporal position slicing.
+
+        Args:
+            temporal_pos_offset: Start index in temporal tokens (post-tubelet).
+        """
         x = self.patch_embed(x)
         B, C, T, H, W = x.shape
         x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
@@ -485,7 +512,13 @@ class PretrainVideoMamba(nn.Module):
             cls_tokens = x[:B, :1, :]
             x = x[:, 1:]
             x = rearrange(x, "(b t) n m -> (b n) t m", b=B, t=T)
-            x = x + self.temporal_pos_embedding
+            temporal_pos_embed = self._get_temporal_pos_embedding(
+                T,
+                offset=temporal_pos_offset,
+                dtype=x.dtype,
+                device=x.device,
+            )
+            x = x + temporal_pos_embed
             x = rearrange(x, "(b n) t m -> b (t n) m", b=B, t=T)
             x = torch.cat((cls_tokens, x), dim=1)
 
@@ -590,11 +623,26 @@ class PretrainVideoMamba(nn.Module):
         return x_vis, x_clip_vis, ssm_state
 
     def forward(
-        self, x, mask=None, use_image=False, keep_temporal=False, ssm_state=None
+        self,
+        x,
+        mask=None,
+        use_image=False,
+        keep_temporal=False,
+        ssm_state=None,
+        temporal_pos_offset=0,
     ):
+        """Forward with optional temporal position offset.
+
+        Args:
+            temporal_pos_offset: Start index in temporal tokens (post-tubelet).
+        """
         T = x.shape[2]
         features = self.forward_features(
-            x, mask, use_image, ssm_state=ssm_state
+            x,
+            mask,
+            use_image,
+            ssm_state=ssm_state,
+            temporal_pos_offset=temporal_pos_offset,
         )  # [B, N_vis, C_e]
         if ssm_state is None:
             x_vis, x_clip_vis = features
