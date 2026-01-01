@@ -228,10 +228,21 @@ def compute_n_params(model, return_str=True):
         return tot
 
 
-def setup_seed(seed):
+def setup_seed(seed: int, deterministic: bool = False):
+    """Seed RNGs and optionally enable deterministic CUDA behavior."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True)
+        except AttributeError:
+            pass
 
 
 def remove_files_if_exist(file_paths):

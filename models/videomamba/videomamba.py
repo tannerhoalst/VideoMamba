@@ -4,7 +4,7 @@ import logging
 import math
 import os
 from functools import partial
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -19,6 +19,9 @@ from torch import Tensor
 from .mamba_simple import Mamba
 
 logger = logging.getLogger(__name__)
+
+LayerState = Union[Tensor, Tuple[Tensor, Tensor]]
+StateCollection = Union[List[LayerState], Tuple[LayerState, ...], Dict[int, LayerState]]
 
 
 class Block(nn.Module):
@@ -59,12 +62,12 @@ class Block(nn.Module):
         self,
         hidden_states: Tensor,
         residual: Optional[Tensor] = None,
-        inference_params=None,
-        use_checkpoint=False,
+        inference_params: Optional[object] = None,
+        use_checkpoint: bool = False,
         ssm_state: Optional[Tensor] = None,
         state: Optional[Tuple[Tensor, Tensor]] = None,
         return_state: bool = False,
-    ):
+    ) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tuple[Tensor, Tensor]]]:
         r"""Pass the input through the encoder layer.
 
         Args:
@@ -124,7 +127,9 @@ class Block(nn.Module):
             return hidden_states, residual, new_state
         return hidden_states, residual
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, dtype=None, **kwargs
+    ) -> Tuple[Tensor, Tensor]:
         return self.mixer.allocate_inference_cache(
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
@@ -423,7 +428,9 @@ class PretrainVideoMamba(nn.Module):
             for i, layer in enumerate(self.layers)
         }
 
-    def init_ssm_state(self, batch_size, dtype=None, device=None, as_dict=False):
+    def init_ssm_state(
+        self, batch_size: int, dtype=None, device=None, as_dict: bool = False
+    ) -> Union[List[Tensor], Dict[int, Tensor]]:
         states = {} if as_dict else []
         for idx, layer in enumerate(self.layers):
             _, layer_state = layer.allocate_inference_cache(
@@ -437,7 +444,9 @@ class PretrainVideoMamba(nn.Module):
                 states.append(layer_state)
         return states
 
-    def init_state(self, batch_size, dtype=None, device=None, as_dict=False):
+    def init_state(
+        self, batch_size: int, dtype=None, device=None, as_dict: bool = False
+    ) -> Union[List[Tuple[Tensor, Tensor]], Dict[int, Tuple[Tensor, Tensor]]]:
         states = {} if as_dict else []
         for idx, layer in enumerate(self.layers):
             layer_state = layer.mixer.allocate_state(
@@ -460,7 +469,7 @@ class PretrainVideoMamba(nn.Module):
     def load_pretrained(self, checkpoint_path, prefix=""):
         _load_weights(self, checkpoint_path, prefix)
 
-    def _get_layer_state(self, state, layer_idx):
+    def _get_layer_state(self, state: Optional[StateCollection], layer_idx: int):
         if state is None:
             return None
         if isinstance(state, dict):
@@ -469,7 +478,9 @@ class PretrainVideoMamba(nn.Module):
             return state[layer_idx]
         raise TypeError("state must be a list, tuple, or dict indexed by layer id")
 
-    def _get_temporal_pos_embedding(self, seqlen, offset=0, dtype=None, device=None):
+    def _get_temporal_pos_embedding(
+        self, seqlen: int, offset: int = 0, dtype=None, device=None
+    ) -> Tensor:
         """Return temporal positional embeddings for a slice starting at offset."""
         if offset < 0:
             raise ValueError("temporal_pos_offset must be non-negative.")
@@ -490,12 +501,18 @@ class PretrainVideoMamba(nn.Module):
         return pos[:, offset:end]
 
     def forward_features(
-        self, x, mask=None, use_image=False, ssm_state=None, temporal_pos_offset=0
+        self,
+        x: Tensor,
+        mask: Optional[Tensor] = None,
+        use_image: bool = False,
+        ssm_state: Optional[StateCollection] = None,
+        temporal_pos_offset: int = 0,
     ):
         """Forward features with temporal position slicing.
 
         Args:
             temporal_pos_offset: Start index in temporal tokens (post-tubelet).
+            ssm_state: Optional per-layer state (ssm_state or (conv_state, ssm_state)).
         """
         x = self.patch_embed(x)
         B, C, T, H, W = x.shape
@@ -624,17 +641,23 @@ class PretrainVideoMamba(nn.Module):
 
     def forward(
         self,
-        x,
-        mask=None,
-        use_image=False,
-        keep_temporal=False,
-        ssm_state=None,
-        temporal_pos_offset=0,
-    ):
+        x: Tensor,
+        mask: Optional[Tensor] = None,
+        use_image: bool = False,
+        keep_temporal: bool = False,
+        ssm_state: Optional[StateCollection] = None,
+        temporal_pos_offset: int = 0,
+    ) -> Union[
+        Tuple[Tensor, Tensor, Optional[Tensor]],
+        Tuple[Tensor, Tensor, Optional[Tensor], StateCollection],
+        Tuple[Tensor, Optional[Tensor]],
+        Tuple[Tensor, Optional[Tensor], StateCollection],
+    ]:
         """Forward with optional temporal position offset.
 
         Args:
             temporal_pos_offset: Start index in temporal tokens (post-tubelet).
+            ssm_state: Optional per-layer state (ssm_state or (conv_state, ssm_state)).
         """
         T = x.shape[2]
         features = self.forward_features(

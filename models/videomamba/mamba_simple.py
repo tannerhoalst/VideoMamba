@@ -2,7 +2,8 @@
 
 import inspect
 import math
-from typing import Optional, Tuple
+import os
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -190,6 +191,9 @@ class Mamba(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        disable_fused = os.getenv("VIDEOMAMBA_DISABLE_FUSED", "").lower()
+        if disable_fused in {"1", "true", "yes", "y", "on"}:
+            use_fast_path = False
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
 
@@ -259,12 +263,12 @@ class Mamba(nn.Module):
 
     def forward(
         self,
-        hidden_states,
-        inference_params=None,
+        hidden_states: Tensor,
+        inference_params: Optional[object] = None,
         ssm_state: Optional[Tensor] = None,
         state: Optional[Tuple[Tensor, Tensor]] = None,
         return_state: bool = False,
-    ):
+    ) -> Union[Tensor, Tuple[Tensor, Tuple[Tensor, Tensor]]]:
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states unless return_state=True.
@@ -409,7 +413,9 @@ class Mamba(nn.Module):
             return out, (new_conv_state, new_ssm_state)
         return out
 
-    def step(self, hidden_states, conv_state, ssm_state):
+    def step(
+        self, hidden_states: Tensor, conv_state: Tensor, ssm_state: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         assert (
             hidden_states.shape[1] == 1
         ), "Only support decoding with 1 token at a time for now"
@@ -448,7 +454,9 @@ class Mamba(nn.Module):
         out = self.out_proj(y)
         return out.unsqueeze(1), conv_state, ssm_state
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, dtype=None, **kwargs
+    ) -> Tuple[Tensor, Tensor]:
         device = self.out_proj.weight.device
         conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
         conv_state = torch.zeros(
@@ -469,7 +477,9 @@ class Mamba(nn.Module):
         )
         return conv_state, ssm_state
 
-    def allocate_state(self, batch_size, dtype=None, device=None):
+    def allocate_state(
+        self, batch_size: int, dtype=None, device=None
+    ) -> Tuple[Tensor, Tensor]:
         """Allocate zero (conv_state, ssm_state) for streaming training."""
         if device is None:
             device = self.out_proj.weight.device
@@ -492,8 +502,8 @@ class Mamba(nn.Module):
         return conv_state, ssm_state
 
     def _get_states_from_cache(
-        self, inference_params, batch_size, initialize_states=False
-    ):
+        self, inference_params, batch_size: int, initialize_states: bool = False
+    ) -> Tuple[Tensor, Tensor]:
         assert self.layer_idx is not None
         if self.layer_idx not in inference_params.key_value_memory_dict:
             batch_shape = (batch_size,)
