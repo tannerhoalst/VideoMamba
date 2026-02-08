@@ -31,6 +31,8 @@ dev = [
     "pytest",
     "black",
     "isort",
+    "ruff>=0.15.0",
+    "pyright>=1.1.408",
 ]
 
 [tool.setuptools]
@@ -43,3 +45,15 @@ include = ["models*", "utils*"]
 [tool.isort]
 profile = "black"
 line_length = 88
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+extend-exclude = [".venv", "video_mamba.egg-info"]
+
+[tool.pyright]
+include = ["models", "utils", "scripts"]
+exclude = [".venv", "video_mamba.egg-info", "**/__pycache__"]
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"

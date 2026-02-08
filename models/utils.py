@@ -1,4 +1,5 @@
 import logging
+from typing import Callable, cast
 
 import numpy as np
 import torch
@@ -175,8 +176,9 @@ def interpolate_pos_relative_bias_beit(state_dict_old, state_dict_new, patch_sha
                 for i in range(num_attn_heads):
                     z = rel_pos_bias[:, i].view(src_size, src_size).float().numpy()
                     f = interpolate.interp2d(x, y, z, kind="cubic")
+                    f_interp = cast(Callable[[np.ndarray, np.ndarray], np.ndarray], f)
                     all_rel_pos_bias.append(
-                        torch.Tensor(f(dx, dy))
+                        torch.Tensor(f_interp(dx, dy))
                         .contiguous()
                         .view(-1, 1)
                         .to(rel_pos_bias.device)

@@ -1,5 +1,4 @@
 import datetime
-import io
 import json
 import logging
 import os
@@ -264,9 +263,9 @@ def load_json(filename):
         return json.load(f)
 
 
-def flat_list_of_lists(l):
+def flat_list_of_lists(list_of_lists):
     """flatten a list of lists [[1,2], [3,4]] to [1,2,3,4]"""
-    return [item for sublist in l for item in sublist]
+    return [item for sublist in list_of_lists for item in sublist]
 
 
 def find_files_by_suffix_recursively(root: str, suffix: Union[str, List[str]]):

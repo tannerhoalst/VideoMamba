@@ -1,5 +1,6 @@
 import logging
 from functools import lru_cache
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -85,10 +86,10 @@ class VTC_VTM_Loss(nn.Module):
         """
         if all_gather:
             gather_args = self.get_gather_args()
-            vision_proj = allgather_wgrad(vision_proj, gather_args)
-            text_proj = allgather_wgrad(text_proj, gather_args)
+            vision_proj = cast(torch.Tensor, allgather_wgrad(vision_proj, gather_args))
+            text_proj = cast(torch.Tensor, allgather_wgrad(text_proj, gather_args))
             if idx is not None:
-                idx = allgather_wgrad(idx, gather_args)
+                idx = cast(torch.Tensor, allgather_wgrad(idx, gather_args))
 
         sim_v2t, sim_t2v = get_sim(vision_proj, text_proj, temp)
 
@@ -304,6 +305,8 @@ class MLMLoss(nn.Module):
         probability_matrix=None,
     ):
         if masked_indices is None:
+            if probability_matrix is None:
+                raise ValueError("probability_matrix must be provided when masked_indices is None")
             masked_indices = torch.bernoulli(probability_matrix).bool()
 
         masked_indices[input_ids == self.tokenizer.pad_token_id] = False

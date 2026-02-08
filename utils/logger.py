@@ -6,13 +6,23 @@ import logging
 import os
 import sys
 import time
-from typing import Any, Dict, Union
+from typing import Optional, Protocol
 
-import torch
 import wandb
 from termcolor import colored
 
 from .distributed import get_rank, is_main_process
+
+
+class SummaryWriterProtocol(Protocol):
+    def close(self) -> None:
+        ...
+
+    def add_scalar(self, tag, scalar_value, global_step=None) -> None:
+        ...
+
+    def add_histogram(self, tag, values, global_step=None) -> None:
+        ...
 
 
 def log_dict_to_wandb(log_dict, step, prefix=""):
@@ -38,7 +48,7 @@ def setup_wandb(config):
     return run
 
 
-def setup_output_folder(save_dir: str, folder_only: bool = False):
+def setup_output_folder(save_dir: str = ".", folder_only: bool = False) -> str:
     """Sets up and returns the output file where the logs will be placed
     based on the configuration passed. Usually "save_dir/logs/log_<timestamp>.txt".
     If env.log_dir is passed, logs will be directly saved in this folder.
@@ -55,7 +65,7 @@ def setup_output_folder(save_dir: str, folder_only: bool = False):
     log_folder = os.path.join(save_dir, "logs")
 
     if not os.path.exists(log_folder):
-        os.path.mkdirs(log_folder)
+        os.makedirs(log_folder, exist_ok=True)
 
     if folder_only:
         return log_folder
@@ -66,7 +76,7 @@ def setup_output_folder(save_dir: str, folder_only: bool = False):
 
 
 def setup_logger(
-    output: str = None,
+    output: Optional[str] = None,
     color: bool = True,
     name: str = "mmf",
     disable: bool = False,
@@ -218,7 +228,7 @@ class TensorboardLogger:
         # This would handle warning of missing tensorboard
         from torch.utils.tensorboard import SummaryWriter
 
-        self.summary_writer = None
+        self.summary_writer: Optional[SummaryWriterProtocol] = None
         self._is_master = is_main_process()
         # self.timer = Timer()
         self.log_folder = log_folder
@@ -234,6 +244,7 @@ class TensorboardLogger:
 
     def __del__(self):
         if getattr(self, "summary_writer", None) is not None:
+            assert self.summary_writer is not None
             self.summary_writer.close()
 
     def _should_log_tensorboard(self):
@@ -246,12 +257,14 @@ class TensorboardLogger:
         if not self._should_log_tensorboard():
             return
 
+        assert self.summary_writer is not None
         self.summary_writer.add_scalar(key, value, iteration)
 
     def add_scalars(self, scalar_dict, iteration):
         if not self._should_log_tensorboard():
             return
 
+        assert self.summary_writer is not None
         for key, val in scalar_dict.items():
             self.summary_writer.add_scalar(key, val, iteration)
 
@@ -259,6 +272,7 @@ class TensorboardLogger:
         if not self._should_log_tensorboard():
             return
 
+        assert self.summary_writer is not None
         for name, param in model.named_parameters():
             np_param = param.clone().cpu().data.numpy()
             self.summary_writer.add_histogram(name, np_param, iteration)

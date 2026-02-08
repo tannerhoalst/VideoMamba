@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import sys
 from os.path import dirname, join
 
 import torch.distributed as dist
@@ -150,7 +149,7 @@ def setup_deepspeed_config(config):
             ), "You must use fp16 or bf16 when using ZERO!!!"
 
         if config.get("max_grad_norm", -1) > 0:
-            ds_config.update({"gradient_clipping", config.max_grad_norm})
+            ds_config.update({"gradient_clipping": config.max_grad_norm})
 
         writer.write(json.dumps(ds_config, indent=2))
 

@@ -2,9 +2,8 @@
 # All rights reserved.
 import logging
 import math
-import os
 from functools import partial
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union, cast
 
 import numpy as np
 import torch
@@ -12,11 +11,13 @@ import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from einops import rearrange
 from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
-from timm.layers import DropPath, to_2tuple, trunc_normal_
+from timm.layers.drop import DropPath
+from timm.layers.helpers import to_2tuple
+from timm.layers.weight_init import trunc_normal_
 from timm.models.vision_transformer import _cfg, _load_weights
 from torch import Tensor
 
-from .mamba_simple import Mamba
+from .mamba_simple import InferenceParamsLike, Mamba
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +25,44 @@ LayerState = Union[Tensor, Tuple[Tensor, Tensor]]
 StateCollection = Union[List[LayerState], Tuple[LayerState, ...], Dict[int, LayerState]]
 
 
+class NormLayerProtocol(Protocol):
+    weight: Tensor
+    bias: Optional[Tensor]
+    eps: float
+
+    def __call__(self, __x: Tensor) -> Tensor:
+        ...
+
+
+class MixerProtocol(Protocol):
+    def __call__(
+        self,
+        hidden_states: Tensor,
+        inference_params: Optional[InferenceParamsLike] = None,
+        ssm_state: Optional[Tensor] = None,
+        state: Optional[Tuple[Tensor, Tensor]] = None,
+        return_state: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tuple[Tensor, Tensor]]]:
+        ...
+
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, dtype=None, **kwargs
+    ) -> Tuple[Tensor, Tensor]:
+        ...
+
+    def allocate_state(self, batch_size: int, dtype=None, device=None) -> Tuple[Tensor, Tensor]:
+        ...
+
+
 class Block(nn.Module):
     def __init__(
         self,
-        dim,
-        mixer_cls,
-        norm_cls=nn.LayerNorm,
-        fused_add_norm=False,
-        residual_in_fp32=False,
-        drop_path=0.0,
+        dim: int,
+        mixer_cls: Callable[[int], MixerProtocol],
+        norm_cls: Callable[[int], nn.Module] = nn.LayerNorm,
+        fused_add_norm: bool = False,
+        residual_in_fp32: bool = False,
+        drop_path: float = 0.0,
     ):
         """
         Simple block wrapping a mixer class with LayerNorm/RMSNorm and residual connection"
@@ -49,8 +79,8 @@ class Block(nn.Module):
         super().__init__()
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
-        self.mixer = mixer_cls(dim)
-        self.norm = norm_cls(dim)
+        self.mixer = cast(MixerProtocol, mixer_cls(dim))
+        self.norm = cast(NormLayerProtocol, norm_cls(dim))
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
@@ -62,7 +92,7 @@ class Block(nn.Module):
         self,
         hidden_states: Tensor,
         residual: Optional[Tensor] = None,
-        inference_params: Optional[object] = None,
+        inference_params: Optional[InferenceParamsLike] = None,
         use_checkpoint: bool = False,
         ssm_state: Optional[Tensor] = None,
         state: Optional[Tuple[Tensor, Tensor]] = None,
@@ -84,6 +114,7 @@ class Block(nn.Module):
                 if residual is not None
                 else hidden_states
             )
+            assert residual is not None
             hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
             if self.residual_in_fp32:
                 residual = residual.to(torch.float32)
@@ -91,40 +122,57 @@ class Block(nn.Module):
             fused_add_norm_fn = (
                 rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
             )
-            hidden_states, residual = fused_add_norm_fn(
-                hidden_states if residual is None else self.drop_path(hidden_states),
-                self.norm.weight,
-                self.norm.bias,
-                residual=residual,
-                prenorm=True,
-                residual_in_fp32=self.residual_in_fp32,
-                eps=self.norm.eps,
+            hidden_states, residual = cast(
+                Tuple[Tensor, Tensor],
+                fused_add_norm_fn(
+                    hidden_states if residual is None else self.drop_path(hidden_states),
+                    self.norm.weight,
+                    self.norm.bias,
+                    residual=residual,
+                    prenorm=True,
+                    residual_in_fp32=self.residual_in_fp32,
+                    eps=self.norm.eps,
+                ),
             )
         if use_checkpoint:
             if state is not None:
-                hidden_states, new_state = checkpoint.checkpoint(
-                    self.mixer, hidden_states, inference_params, None, state, True
+                hidden_states, new_state = cast(
+                    Tuple[Tensor, Tuple[Tensor, Tensor]],
+                    checkpoint.checkpoint(
+                        self.mixer, hidden_states, inference_params, None, state, True
+                    ),
                 )
             else:
-                hidden_states = checkpoint.checkpoint(
-                    self.mixer, hidden_states, inference_params, ssm_state
+                hidden_states = cast(
+                    Tensor,
+                    checkpoint.checkpoint(
+                        self.mixer, hidden_states, inference_params, ssm_state
+                    ),
                 )
         else:
             if state is not None:
-                hidden_states, new_state = self.mixer(
-                    hidden_states,
-                    inference_params=inference_params,
-                    state=state,
-                    return_state=True,
+                hidden_states, new_state = cast(
+                    Tuple[Tensor, Tuple[Tensor, Tensor]],
+                    self.mixer(
+                        hidden_states,
+                        inference_params=inference_params,
+                        state=state,
+                        return_state=True,
+                    ),
                 )
             else:
-                hidden_states = self.mixer(
-                    hidden_states,
-                    inference_params=inference_params,
-                    ssm_state=ssm_state,
+                hidden_states = cast(
+                    Tensor,
+                    self.mixer(
+                        hidden_states,
+                        inference_params=inference_params,
+                        ssm_state=ssm_state,
+                    ),
                 )
         if state is not None:
+            assert residual is not None
             return hidden_states, residual, new_state
+        assert residual is not None
         return hidden_states, residual
 
     def allocate_inference_cache(
@@ -136,19 +184,23 @@ class Block(nn.Module):
 
 
 def create_block(
-    d_model,
-    ssm_cfg=None,
-    norm_epsilon=1e-5,
-    drop_path=0.0,
-    rms_norm=True,
-    residual_in_fp32=True,
-    fused_add_norm=True,
-    layer_idx=None,
-    bimamba=True,
-    device=None,
-    dtype=None,
+    d_model: int,
+    ssm_cfg: Optional[Dict[str, object]] = None,
+    norm_epsilon: float = 1e-5,
+    drop_path: float = 0.0,
+    rms_norm: bool = True,
+    residual_in_fp32: bool = True,
+    fused_add_norm: bool = True,
+    layer_idx: Optional[int] = None,
+    bimamba: bool = True,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
 ):
-    factory_kwargs = {"device": device, "dtype": dtype}
+    factory_kwargs: Dict[str, object] = {}
+    if device is not None:
+        factory_kwargs["device"] = device
+    if dtype is not None:
+        factory_kwargs["dtype"] = dtype
     if ssm_cfg is None:
         ssm_cfg = {}
     mixer_cls = partial(
@@ -163,7 +215,7 @@ def create_block(
         fused_add_norm=fused_add_norm,
         residual_in_fp32=residual_in_fp32,
     )
-    block.layer_idx = layer_idx
+    object.__setattr__(block, "layer_idx", layer_idx)
     return block
 
 
@@ -214,22 +266,29 @@ class PatchEmbed(nn.Module):
     """Image to Patch Embedding"""
 
     def __init__(
-        self, img_size=224, patch_size=16, kernel_size=1, in_chans=3, embed_dim=768
+        self,
+        img_size: Union[int, Tuple[int, int]] = 224,
+        patch_size: Union[int, Tuple[int, int]] = 16,
+        kernel_size: int = 1,
+        in_chans: int = 3,
+        embed_dim: int = 768,
     ):
         super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
-        self.img_size = img_size
-        self.patch_size = patch_size
+        img_size_2d = cast(Tuple[int, int], to_2tuple(img_size))
+        patch_size_2d = cast(Tuple[int, int], to_2tuple(patch_size))
+        num_patches = (img_size_2d[1] // patch_size_2d[1]) * (
+            img_size_2d[0] // patch_size_2d[0]
+        )
+        self.img_size = img_size_2d
+        self.patch_size = patch_size_2d
         self.num_patches = num_patches
         self.tubelet_size = kernel_size
 
         self.proj = nn.Conv3d(
             in_chans,
             embed_dim,
-            kernel_size=(kernel_size, patch_size[0], patch_size[1]),
-            stride=(kernel_size, patch_size[0], patch_size[1]),
+            kernel_size=(kernel_size, patch_size_2d[0], patch_size_2d[1]),
+            stride=(kernel_size, patch_size_2d[0], patch_size_2d[1]),
         )
 
     def forward(self, x):
@@ -238,7 +297,12 @@ class PatchEmbed(nn.Module):
 
 
 class Linear_Decoder(nn.Module):
-    def __init__(self, output_dim=768, embed_dim=768, norm_layer=nn.LayerNorm):
+    def __init__(
+        self,
+        output_dim: int = 768,
+        embed_dim: int = 768,
+        norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
+    ):
         super().__init__()
 
         self.head = nn.Linear(embed_dim, output_dim)
@@ -286,37 +350,41 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 class PretrainVideoMamba(nn.Module):
     def __init__(
         self,
-        img_size=224,
-        patch_size=16,
-        depth=24,
-        embed_dim=192,
-        channels=3,
-        drop_path_rate=0.0,
-        ssm_cfg=None,
-        norm_epsilon=1e-5,
-        initializer_cfg=None,
-        fused_add_norm=True,
-        rms_norm=True,
-        residual_in_fp32=True,
-        bimamba=True,
-        pool_type="cls+avg",
+        img_size: int = 224,
+        patch_size: int = 16,
+        depth: int = 24,
+        embed_dim: int = 192,
+        channels: int = 3,
+        drop_path_rate: float = 0.0,
+        ssm_cfg: Optional[Dict[str, object]] = None,
+        norm_epsilon: float = 1e-5,
+        initializer_cfg: Optional[Dict[str, object]] = None,
+        fused_add_norm: bool = True,
+        rms_norm: bool = True,
+        residual_in_fp32: bool = True,
+        bimamba: bool = True,
+        pool_type: str = "cls+avg",
         # video
-        kernel_size=1,
-        num_frames=8,
-        device=None,
-        dtype=None,
+        kernel_size: int = 1,
+        num_frames: int = 8,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
         # checkpoint
-        use_checkpoint=False,
-        checkpoint_num=0,
+        use_checkpoint: bool = False,
+        checkpoint_num: int = 0,
         # clip,
-        clip_decoder_embed_dim=768,
-        clip_output_dim=512,
-        clip_return_layer=1,
-        clip_student_return_interval=1,
-        add_pool_norm=True,
-        in_chans=None,
+        clip_decoder_embed_dim: int = 768,
+        clip_output_dim: int = 512,
+        clip_return_layer: int = 1,
+        clip_student_return_interval: int = 1,
+        add_pool_norm: bool = True,
+        in_chans: Optional[int] = None,
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}  # follow MambaLMHeadModel
+        factory_kwargs: Dict[str, object] = {}  # follow MambaLMHeadModel
+        if device is not None:
+            factory_kwargs["device"] = device
+        if dtype is not None:
+            factory_kwargs["dtype"] = dtype
         super().__init__()
         input_channels = channels if in_chans is None else in_chans
         self.residual_in_fp32 = residual_in_fp32
@@ -373,15 +441,18 @@ class PretrainVideoMamba(nn.Module):
                     layer_idx=i,
                     bimamba=bimamba,
                     drop_path=inter_dpr[i],
-                    **factory_kwargs,
+                    **cast(Dict[str, Any], factory_kwargs),
                 )
                 for i in range(depth)
             ]
         )
 
         # output head
-        self.norm = (nn.LayerNorm if not rms_norm else RMSNorm)(
-            embed_dim, eps=norm_epsilon, **factory_kwargs
+        self.norm = cast(
+            NormLayerProtocol,
+            (nn.LayerNorm if not rms_norm else RMSNorm)(
+                embed_dim, eps=norm_epsilon, **cast(Dict[str, Any], factory_kwargs)
+            ),
         )
 
         # CLIP decoder
@@ -420,45 +491,63 @@ class PretrainVideoMamba(nn.Module):
             )
         )
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
+    def allocate_inference_cache(
+        self, batch_size: int, max_seqlen: int, dtype=None, **kwargs
+    ) -> Dict[int, Tuple[Tensor, Tensor]]:
         return {
-            i: layer.allocate_inference_cache(
+            i: cast(Block, layer_module).allocate_inference_cache(
                 batch_size, max_seqlen, dtype=dtype, **kwargs
             )
-            for i, layer in enumerate(self.layers)
+            for i, layer_module in enumerate(self.layers)
         }
 
     def init_ssm_state(
         self, batch_size: int, dtype=None, device=None, as_dict: bool = False
     ) -> Union[List[Tensor], Dict[int, Tensor]]:
-        states = {} if as_dict else []
-        for idx, layer in enumerate(self.layers):
+        if as_dict:
+            states_dict: Dict[int, Tensor] = {}
+            for idx, layer_module in enumerate(self.layers):
+                layer = cast(Block, layer_module)
+                _, layer_state = layer.allocate_inference_cache(
+                    batch_size, max_seqlen=1, dtype=dtype
+                )
+                if device is not None:
+                    layer_state = layer_state.to(device=device)
+                states_dict[idx] = layer_state
+            return states_dict
+        states_list: List[Tensor] = []
+        for _, layer_module in enumerate(self.layers):
+            layer = cast(Block, layer_module)
             _, layer_state = layer.allocate_inference_cache(
                 batch_size, max_seqlen=1, dtype=dtype
             )
             if device is not None:
                 layer_state = layer_state.to(device=device)
-            if as_dict:
-                states[idx] = layer_state
-            else:
-                states.append(layer_state)
-        return states
+            states_list.append(layer_state)
+        return states_list
 
     def init_state(
         self, batch_size: int, dtype=None, device=None, as_dict: bool = False
     ) -> Union[List[Tuple[Tensor, Tensor]], Dict[int, Tuple[Tensor, Tensor]]]:
-        states = {} if as_dict else []
-        for idx, layer in enumerate(self.layers):
-            layer_state = layer.mixer.allocate_state(
-                batch_size, dtype=dtype, device=device
+        if as_dict:
+            states_dict: Dict[int, Tuple[Tensor, Tensor]] = {}
+            for idx, layer_module in enumerate(self.layers):
+                layer = cast(Block, layer_module)
+                mixer = layer.mixer
+                states_dict[idx] = mixer.allocate_state(
+                    batch_size, dtype=dtype, device=device
+                )
+            return states_dict
+        states_list: List[Tuple[Tensor, Tensor]] = []
+        for _, layer_module in enumerate(self.layers):
+            layer = cast(Block, layer_module)
+            mixer = layer.mixer
+            states_list.append(
+                mixer.allocate_state(batch_size, dtype=dtype, device=device)
             )
-            if as_dict:
-                states[idx] = layer_state
-            else:
-                states.append(layer_state)
-        return states
+        return states_list
 
-    @torch.jit.ignore
+    @torch.jit.ignore()
     def no_weight_decay(self):
         return {"pos_embed", "cls_token"}
 
@@ -467,9 +556,11 @@ class PretrainVideoMamba(nn.Module):
 
     @torch.jit.ignore()
     def load_pretrained(self, checkpoint_path, prefix=""):
-        _load_weights(self, checkpoint_path, prefix)
+        _load_weights(cast(Any, self), checkpoint_path, prefix)
 
-    def _get_layer_state(self, state: Optional[StateCollection], layer_idx: int):
+    def _get_layer_state(
+        self, state: Optional[StateCollection], layer_idx: int
+    ) -> Optional[LayerState]:
         if state is None:
             return None
         if isinstance(state, dict):
@@ -507,7 +598,10 @@ class PretrainVideoMamba(nn.Module):
         use_image: bool = False,
         ssm_state: Optional[StateCollection] = None,
         temporal_pos_offset: int = 0,
-    ):
+    ) -> Union[
+        Tuple[Tensor, Tensor],
+        Tuple[Tensor, Tensor, StateCollection],
+    ]:
         """Forward features with temporal position slicing.
 
         Args:
@@ -544,21 +638,24 @@ class PretrainVideoMamba(nn.Module):
             x_vis = x[~mask].reshape(B, -1, C)  # ~mask means visible
         else:
             x_vis = x
-        x_clip_vis = []
+        x_clip_vis_list: List[Tensor] = []
 
         # mamba impl
         residual = None
         hidden_states = x_vis
-        new_states = None
+        new_states: Optional[Union[Dict[int, LayerState], List[Optional[LayerState]]]] = None
         return_tuple_state = False
-        for idx, layer in enumerate(self.layers):
+        for idx, layer_module in enumerate(self.layers):
+            layer = cast(Block, layer_module)
             layer_state = self._get_layer_state(ssm_state, idx)
             is_full_state = isinstance(layer_state, (list, tuple)) and len(layer_state) == 2
             if is_full_state and new_states is None:
                 if isinstance(ssm_state, dict):
                     new_states = {}
                 else:
-                    new_states = [None] * len(self.layers)
+                    new_states = [
+                        cast(Optional[LayerState], None) for _ in range(len(self.layers))
+                    ]
                     return_tuple_state = isinstance(ssm_state, tuple)
             if self.use_checkpoint and idx < self.checkpoint_num:
                 if is_full_state:
@@ -596,11 +693,13 @@ class PretrainVideoMamba(nn.Module):
                     )
             if new_states is not None:
                 if isinstance(new_states, dict):
+                    assert layer_state is not None
                     new_states[idx] = layer_state
                 else:
                     new_states[idx] = layer_state
             if (idx - 1) in self.return_index:
-                x_clip_vis.append(
+                assert residual is not None
+                x_clip_vis_list.append(
                     self.norm(residual.to(dtype=self.norm.weight.dtype))
                 )  # share norm for mask
 
@@ -615,27 +714,44 @@ class PretrainVideoMamba(nn.Module):
             fused_add_norm_fn = (
                 rms_norm_fn if isinstance(self.norm, RMSNorm) else layer_norm_fn
             )
-            hidden_states = fused_add_norm_fn(
-                self.drop_path(hidden_states),
-                self.norm.weight,
-                self.norm.bias,
-                eps=self.norm.eps,
-                residual=residual,
-                prenorm=False,
-                residual_in_fp32=self.residual_in_fp32,
+            hidden_states = cast(
+                Tensor,
+                fused_add_norm_fn(
+                    self.drop_path(hidden_states),
+                    self.norm.weight,
+                    self.norm.bias,
+                    eps=self.norm.eps,
+                    residual=residual,
+                    prenorm=False,
+                    residual_in_fp32=self.residual_in_fp32,
+                ),
             )
 
         if (self.depth - 1) in self.return_index:
-            x_clip_vis.append(residual)
+            assert residual is not None
+            x_clip_vis_list.append(residual)
 
         x_vis = hidden_states
-        x_clip_vis = torch.stack(x_clip_vis)
+        x_clip_vis = torch.stack(x_clip_vis_list)
 
         if new_states is not None and return_tuple_state:
-            new_states = tuple(new_states)
+            maybe_states = cast(List[Optional[LayerState]], new_states)
+            finalized_states: List[LayerState] = []
+            for state_item in maybe_states:
+                if state_item is None:
+                    raise ValueError("Expected full state for all layers.")
+                finalized_states.append(state_item)
+            return x_vis, x_clip_vis, tuple(finalized_states)
         if ssm_state is None:
             return x_vis, x_clip_vis
         if new_states is not None:
+            if isinstance(new_states, list):
+                finalized_states: List[LayerState] = []
+                for state_item in new_states:
+                    if state_item is None:
+                        raise ValueError("Expected full state for all layers.")
+                    finalized_states.append(state_item)
+                return x_vis, x_clip_vis, finalized_states
             return x_vis, x_clip_vis, new_states
         return x_vis, x_clip_vis, ssm_state
 
@@ -668,9 +784,11 @@ class PretrainVideoMamba(nn.Module):
             temporal_pos_offset=temporal_pos_offset,
         )  # [B, N_vis, C_e]
         if ssm_state is None:
-            x_vis, x_clip_vis = features
+            x_vis, x_clip_vis = cast(Tuple[Tensor, Tensor], features)
         else:
-            x_vis, x_clip_vis, ssm_state = features
+            x_vis, x_clip_vis, ssm_state = cast(
+                Tuple[Tensor, Tensor, StateCollection], features
+            )
 
         # align CLIP:
         if mask is not None and len(x_clip_vis) > 0:
@@ -728,6 +846,8 @@ class PretrainVideoMamba(nn.Module):
                         x_pool_vis = self.pool_norm(
                             x_vis.view(B, T, -1, C_CLIP).mean(2)
                         )
+                    else:
+                        raise ValueError(f"Unsupported pool_type: {self.pool_type}")
                 else:
                     if self.pool_type == "cls+avg":
                         x_pool_vis = self.pool_norm(
@@ -739,6 +859,8 @@ class PretrainVideoMamba(nn.Module):
                         )
                     elif self.pool_type == "avg":
                         x_pool_vis = self.pool_norm(x_vis.mean(1, keepdim=True))
+                    else:
+                        raise ValueError(f"Unsupported pool_type: {self.pool_type}")
 
             if ssm_state is None:
                 return x_vis, x_pool_vis, x_clip
@@ -837,7 +959,7 @@ def build_videomamba(config, add_pool_norm=True):
         clip_student_return_interval=config.vision_encoder.clip_student_return_interval,
         add_pool_norm=add_pool_norm,
     )
-    model.default_cfg = _cfg()
+    object.__setattr__(model, "default_cfg", _cfg())
     if config.vision_encoder.pretrained is not None:
         load_state_dict(
             pretrained_path=config.vision_encoder.pretrained,
@@ -851,10 +973,8 @@ def build_videomamba(config, add_pool_norm=True):
 
 
 if __name__ == "__main__":
-    import time
 
     import numpy as np
-    from fvcore.nn import FlopCountAnalysis, flop_count_table
 
     seed = 4217
     np.random.seed(seed)
@@ -889,7 +1009,7 @@ if __name__ == "__main__":
             "pretrained": "your_model_path/videomamba_m16_k400_mask_pt_f8_res224.pth",
         }
     }
-    from easydict import EasyDict
+    from utils.easydict import EasyDict
 
     channels = config["vision_encoder"].get("channels", 3)
     model = build_videomamba(EasyDict(config)).cuda()

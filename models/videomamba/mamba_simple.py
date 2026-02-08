@@ -3,7 +3,7 @@
 import inspect
 import math
 import os
-from typing import Optional, Tuple, Union
+from typing import Any, MutableMapping, Optional, Protocol, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from einops import rearrange, repeat
 from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, selective_scan_fn
-from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 from torch import Tensor
 
@@ -21,6 +20,11 @@ try:
     )
 except (TypeError, ValueError):
     _SELECTIVE_SCAN_HAS_INITIAL_STATE = False
+
+
+class InferenceParamsLike(Protocol):
+    seqlen_offset: int
+    key_value_memory_dict: MutableMapping[int, Tuple[Tensor, Tensor]]
 
 
 def _selective_scan_ref(
@@ -35,7 +39,7 @@ def _selective_scan_ref(
     delta_softplus=False,
     initial_state=None,
     return_last_state=False,
-):
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     dtype_in = u.dtype
     u = u.float()
     delta = delta.float()
@@ -96,7 +100,10 @@ def _selective_scan_ref(
     if z is not None:
         out = out * F.silu(z)
     out = out.to(dtype=dtype_in)
-    return out if not return_last_state else (out, last_state)
+    if return_last_state:
+        assert last_state is not None
+        return out, last_state
+    return out
 
 
 def _selective_scan_with_state(
@@ -111,22 +118,26 @@ def _selective_scan_with_state(
     delta_softplus=False,
     initial_state=None,
     return_last_state=False,
-):
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     if initial_state is None:
-        return selective_scan_fn(
-            x,
-            dt,
-            A,
-            B,
-            C,
-            D,
-            z=z,
-            delta_bias=delta_bias,
-            delta_softplus=delta_softplus,
-            return_last_state=return_last_state,
+        return cast(
+            Union[Tensor, Tuple[Tensor, Tensor]],
+            selective_scan_fn(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                z=z,
+                delta_bias=delta_bias,
+                delta_softplus=delta_softplus,
+                return_last_state=return_last_state,
+            ),
         )
     if _SELECTIVE_SCAN_HAS_INITIAL_STATE:
-        return selective_scan_fn(
+        selective_scan_fn_any = cast(Any, selective_scan_fn)
+        return selective_scan_fn_any(
             x,
             dt,
             A,
@@ -164,33 +175,37 @@ def _selective_scan_with_state(
 class Mamba(nn.Module):
     def __init__(
         self,
-        d_model,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        dt_rank="auto",
-        dt_min=0.001,
-        dt_max=0.1,
-        dt_init="random",
-        dt_scale=1.0,
-        dt_init_floor=1e-4,
-        conv_bias=True,
-        bias=False,
-        use_fast_path=True,  # Fused kernel options
-        layer_idx=None,
-        bimamba=True,
-        device=None,
-        dtype=None,
-        **kwargs,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: Union[int, str] = "auto",
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        dt_init_floor: float = 1e-4,
+        conv_bias: bool = True,
+        bias: bool = False,
+        use_fast_path: bool = True,  # Fused kernel options
+        layer_idx: Optional[int] = None,
+        bimamba: bool = True,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+        **_: Any,
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
+        factory_kwargs: dict[str, Any] = {}
+        if device is not None:
+            factory_kwargs["device"] = device
+        if dtype is not None:
+            factory_kwargs["dtype"] = dtype
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else int(dt_rank)
         disable_fused = os.getenv("VIDEOMAMBA_DISABLE_FUSED", "").lower()
         if disable_fused in {"1", "true", "yes", "y", "on"}:
             use_fast_path = False
@@ -238,10 +253,11 @@ class Mamba(nn.Module):
         ).clamp(min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
+        assert self.dt_proj.bias is not None
         with torch.no_grad():
             self.dt_proj.bias.copy_(inv_dt)
         # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
-        self.dt_proj.bias._no_reinit = True
+        setattr(self.dt_proj.bias, "_no_reinit", True)
 
         # S4D real initialization
         A = repeat(
@@ -251,11 +267,11 @@ class Mamba(nn.Module):
         ).contiguous()
         A_log = torch.log(A)  # Keep A_log in fp32
         self.A_log = nn.Parameter(A_log)
-        self.A_log._no_weight_decay = True
+        setattr(self.A_log, "_no_weight_decay", True)
 
         # D "skip" parameter
         self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
-        self.D._no_weight_decay = True
+        setattr(self.D, "_no_weight_decay", True)
 
         self.out_proj = nn.Linear(
             self.d_inner, self.d_model, bias=bias, **factory_kwargs
@@ -264,7 +280,7 @@ class Mamba(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        inference_params: Optional[object] = None,
+        inference_params: Optional[InferenceParamsLike] = None,
         ssm_state: Optional[Tensor] = None,
         state: Optional[Tuple[Tensor, Tensor]] = None,
         return_state: bool = False,
@@ -297,6 +313,8 @@ class Mamba(nn.Module):
             if ssm_state is None:
                 ssm_state = cache_state
             if inference_params.seqlen_offset > 0:
+                assert conv_state is not None
+                assert ssm_state is not None
                 # The states are updated inplace
                 out, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out
@@ -321,10 +339,12 @@ class Mamba(nn.Module):
             and conv_state is None
             and not return_state
         ):
-            out = mamba_inner_fn(
-                xz,
-                self.conv1d.weight,
-                self.conv1d.bias,
+            out = cast(
+                Tensor,
+                mamba_inner_fn(
+                    xz,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
                 self.x_proj.weight,
                 self.dt_proj.weight,
                 self.out_proj.weight,
@@ -334,13 +354,15 @@ class Mamba(nn.Module):
                 None,  # input-dependent C
                 self.D.float(),
                 delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
+                    delta_softplus=True,
+                ),
             )
         else:
             x, z = xz.chunk(2, dim=1)
             x_in = x
             # Compute short convolution
             if use_inference_params:
+                assert conv_state is not None
                 # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                 conv_state.copy_(
@@ -356,6 +378,7 @@ class Mamba(nn.Module):
                     bias=self.conv1d.bias,
                     activation=self.activation,
                 )
+                assert x is not None
                 x = x[..., -seqlen:]
                 if return_state:
                     new_conv_state = x_cat[..., -self.d_conv :]
@@ -366,6 +389,7 @@ class Mamba(nn.Module):
                     bias=self.conv1d.bias,
                     activation=self.activation,
                 )
+                assert x is not None
                 if return_state:
                     new_conv_state = F.pad(
                         x_in, (self.d_conv - x_in.shape[-1], 0)
@@ -388,7 +412,7 @@ class Mamba(nn.Module):
                 ssm_state is not None and state is None and not return_state
             )
             return_last_state = return_state or use_inplace_ssm
-            y = _selective_scan_with_state(
+            scan_out = _selective_scan_with_state(
                 x,
                 dt,
                 A,
@@ -402,14 +426,19 @@ class Mamba(nn.Module):
                 return_last_state=return_last_state,
             )
             if return_last_state:
-                y, last_state = y
+                y, last_state = cast(Tuple[Tensor, Tensor], scan_out)
                 if use_inplace_ssm:
+                    assert ssm_state is not None
                     ssm_state.copy_(last_state)
                 else:
                     new_ssm_state = last_state
+            else:
+                y = cast(Tensor, scan_out)
             y = rearrange(y, "b d l -> b l d")
             out = self.out_proj(y)
         if return_state:
+            assert new_conv_state is not None
+            assert new_ssm_state is not None
             return out, (new_conv_state, new_ssm_state)
         return out
 
@@ -502,11 +531,13 @@ class Mamba(nn.Module):
         return conv_state, ssm_state
 
     def _get_states_from_cache(
-        self, inference_params, batch_size: int, initialize_states: bool = False
+        self,
+        inference_params: InferenceParamsLike,
+        batch_size: int,
+        initialize_states: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         assert self.layer_idx is not None
         if self.layer_idx not in inference_params.key_value_memory_dict:
-            batch_shape = (batch_size,)
             conv_state = torch.zeros(
                 batch_size,
                 self.d_model * self.expand,

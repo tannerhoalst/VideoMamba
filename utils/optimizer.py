@@ -6,7 +6,6 @@ import logging
 import re
 
 import torch
-from apex.optimizers import FusedAdam, FusedLAMB, FusedNovoGrad, FusedSGD
 from torch import optim as optim
 
 from utils.distributed import is_main_process

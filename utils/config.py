@@ -3,12 +3,9 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import os
 import os.path as osp
 import re
-import shutil
 import sys
-import tempfile
 from copy import deepcopy
 from importlib import import_module
 
@@ -16,7 +13,7 @@ import yaml
 
 from .easydict import EasyDict
 
-__all__ = ["Config", "pretty_text"]
+__all__ = ["Config"]
 
 
 BASE_KEY = "_base_"
@@ -67,7 +64,7 @@ class Config(object):
         json.dump(cfg, open(savepath, "w"), indent=2)
 
     @classmethod
-    def get_config(cls, default_config: dict = None):
+    def get_config(cls, default_config: dict | None = None):
         """get a `Config` instance.
 
         Args:
@@ -288,6 +285,6 @@ def eval_string(string, d):
 
     try:
         v = ast.literal_eval(string)
-    except:
+    except (SyntaxError, ValueError):
         v = string
     return v
