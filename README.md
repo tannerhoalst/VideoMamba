@@ -6,9 +6,9 @@
 python3 -m venv .venv
 source .venv/bin/activate
 
-pip install ninja setuptools wheel packaging
-pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130 -U
-pip install --no-build-isolation -U --pre --extra-index-url https://download.pytorch.org/whl/nightly/cu130 -e .
+pip install -U pip setuptools wheel
+pip install -U torch  # install a stable CUDA/CPU wheel that matches your environment
+pip install -e .
 ```
 
 This repository contains a minimal VideoMamba video encoder backbone for use in

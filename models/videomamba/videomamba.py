@@ -855,8 +855,10 @@ class PretrainVideoMamba(nn.Module):
             )
 
         if (self.depth - 1) in self.return_index:
-            assert residual is not None
-            x_clip_vis_list.append(residual)
+            if residual is None:
+                x_clip_vis_list.append(hidden_states)
+            else:
+                x_clip_vis_list.append(self.norm(residual.to(dtype=self.norm.weight.dtype)))
 
         x_vis = hidden_states
         x_clip_vis = torch.stack(x_clip_vis_list) if x_clip_vis_list else None
@@ -962,14 +964,9 @@ class PretrainVideoMamba(nn.Module):
                             x_vis_cls + x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
                         )
                     elif self.pool_type == "cls_cat_avg":
+                        temporal_avg = x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
                         x_pool_vis = self.pool_norm(
-                            torch.cat(
-                                [
-                                    x_vis_cls
-                                    + x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
-                                ],
-                                dim=1,
-                            )
+                            torch.cat([x_vis_cls, temporal_avg], dim=1)
                         )
                     elif self.pool_type == "avg":
                         x_pool_vis = self.pool_norm(

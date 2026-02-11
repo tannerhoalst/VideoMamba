@@ -15,7 +15,6 @@ dependencies = [
     "einops>=0.6",
     "mamba-ssm @ git+https://github.com/state-spaces/mamba",
     "causal-conv1d @ git+https://github.com/Dao-AILab/causal-conv1d",
-    "apex @ git+https://github.com/NVIDIA/apex"
 ]
 
 [project.optional-dependencies]

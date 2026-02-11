@@ -193,3 +193,32 @@ def test_masked_forward_rejects_legacy_mask_shape():
     legacy_mask = torch.zeros(1, 4 * 2 * 2, dtype=torch.bool, device="cuda")
     with pytest.raises(ValueError, match="mask token length mismatch"):
         model(x, mask=legacy_mask, use_image=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_keep_temporal_cls_cat_avg_concatenates_cls_and_temporal_avg():
+    model_add = _small_model(pool_type="cls+avg").cuda().eval()
+    model_cat = _small_model(pool_type="cls_cat_avg").cuda().eval()
+    model_cat.load_state_dict(model_add.state_dict(), strict=True)
+    x = torch.randn(1, 3, 4, 8, 8, device="cuda")
+    temporal_tokens = x.shape[2] // model_add.patch_embed.tubelet_size
+
+    with torch.no_grad():
+        _, pool_add, _ = model_add(x, mask=None, use_image=False, keep_temporal=True)
+        _, pool_cat, _ = model_cat(x, mask=None, use_image=False, keep_temporal=True)
+
+    assert pool_add.shape == (1, temporal_tokens, model_add.embed_dim)
+    assert pool_cat.shape == (1, temporal_tokens + 1, model_cat.embed_dim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_clip_return_layer_gt_one_final_tap_matches_normalized_output():
+    model = _small_model(clip_return_layer=2).cuda().eval()
+    x = torch.randn(2, 3, 4, 8, 8, device="cuda")
+
+    with torch.no_grad():
+        x_vis, x_clip_vis = model.forward_features(x, mask=None, use_image=False)
+
+    assert x_clip_vis is not None
+    assert x_clip_vis.shape[0] == 2
+    torch.testing.assert_close(x_clip_vis[-1], x_vis, rtol=1e-4, atol=1e-4)
