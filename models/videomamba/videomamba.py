@@ -134,20 +134,35 @@ class Block(nn.Module):
                     eps=self.norm.eps,
                 ),
             )
+        new_state: Optional[Tuple[Tensor, Tensor]] = None
         if use_checkpoint:
             if state is not None:
-                hidden_states, new_state = cast(
-                    Tuple[Tensor, Tuple[Tensor, Tensor]],
-                    checkpoint.checkpoint(
-                        self.mixer,
-                        hidden_states,
-                        inference_params,
-                        None,
-                        state,
-                        True,
-                        use_reentrant=False,
-                    ),
-                )
+                if return_state:
+                    hidden_states, new_state = cast(
+                        Tuple[Tensor, Tuple[Tensor, Tensor]],
+                        checkpoint.checkpoint(
+                            self.mixer,
+                            hidden_states,
+                            inference_params,
+                            None,
+                            state,
+                            True,
+                            use_reentrant=False,
+                        ),
+                    )
+                else:
+                    hidden_states = cast(
+                        Tensor,
+                        checkpoint.checkpoint(
+                            self.mixer,
+                            hidden_states,
+                            inference_params,
+                            None,
+                            state,
+                            False,
+                            use_reentrant=False,
+                        ),
+                    )
             else:
                 hidden_states = cast(
                     Tensor,
@@ -161,15 +176,26 @@ class Block(nn.Module):
                 )
         else:
             if state is not None:
-                hidden_states, new_state = cast(
-                    Tuple[Tensor, Tuple[Tensor, Tensor]],
-                    self.mixer(
-                        hidden_states,
-                        inference_params=inference_params,
-                        state=state,
-                        return_state=True,
-                    ),
-                )
+                if return_state:
+                    hidden_states, new_state = cast(
+                        Tuple[Tensor, Tuple[Tensor, Tensor]],
+                        self.mixer(
+                            hidden_states,
+                            inference_params=inference_params,
+                            state=state,
+                            return_state=True,
+                        ),
+                    )
+                else:
+                    hidden_states = cast(
+                        Tensor,
+                        self.mixer(
+                            hidden_states,
+                            inference_params=inference_params,
+                            state=state,
+                            return_state=False,
+                        ),
+                    )
             else:
                 hidden_states = cast(
                     Tensor,
@@ -179,9 +205,13 @@ class Block(nn.Module):
                         ssm_state=ssm_state,
                     ),
                 )
-        if state is not None:
+        if state is not None and return_state:
+            assert new_state is not None
             assert residual is not None
             return hidden_states, residual, new_state
+        if state is not None:
+            assert residual is not None
+            return hidden_states, residual
         assert residual is not None
         return hidden_states, residual
 
@@ -687,18 +717,20 @@ class PretrainVideoMamba(nn.Module):
         device: torch.device,
     ) -> Tensor:
         if use_image:
-            expected_tokens = self.patch_embed.num_patches + 1
-            pos_embed = self.clip_img_pos_embed.to(device=device, dtype=dtype)
-            if expected_tokens > pos_embed.shape[1]:
-                pos_embed = get_sinusoid_encoding_table_torch(
-                    expected_tokens,
-                    self.clip_decoder_embed_dim,
-                    device=device,
-                    dtype=dtype,
-                )
-            else:
-                pos_embed = pos_embed[:, :expected_tokens]
-            return pos_embed.repeat(batch_size, 1, 1)
+            tokens_per_frame = self.patch_embed.num_patches
+            expected_tokens = 1 + temporal_tokens * tokens_per_frame
+            if temporal_tokens == 1 and temporal_pos_offset == 0:
+                pos_embed = self.clip_img_pos_embed.to(device=device, dtype=dtype)
+                if expected_tokens > pos_embed.shape[1]:
+                    pos_embed = get_sinusoid_encoding_table_torch(
+                        expected_tokens,
+                        self.clip_decoder_embed_dim,
+                        device=device,
+                        dtype=dtype,
+                    )
+                else:
+                    pos_embed = pos_embed[:, :expected_tokens]
+                return pos_embed.repeat(batch_size, 1, 1)
 
         if temporal_pos_offset < 0:
             raise ValueError("temporal_pos_offset must be non-negative.")
@@ -736,15 +768,21 @@ class PretrainVideoMamba(nn.Module):
         """
         x = self.patch_embed(x)
         B, C, T, H, W = x.shape
-        x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
 
-        cls_token = self.cls_token.expand(
-            x.shape[0], -1, -1
-        )  # stole cls_tokens impl from Phil Wang, thanks
-        x = torch.cat((cls_token, x), dim=1)
-        x = x + self.pos_embed
-
-        if not use_image:
+        if use_image:
+            x = x.permute(0, 2, 3, 4, 1).reshape(B, T * H * W, C)
+            cls_token = self.cls_token.expand(B, -1, -1)
+            x = torch.cat((cls_token, x), dim=1)
+            cls_pos = self.pos_embed[:, :1]
+            spatial_pos = self.pos_embed[:, 1:].repeat(1, T, 1)
+            x = x + torch.cat((cls_pos, spatial_pos), dim=1)
+        else:
+            x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
+            cls_token = self.cls_token.expand(
+                x.shape[0], -1, -1
+            )  # stole cls_tokens impl from Phil Wang, thanks
+            x = torch.cat((cls_token, x), dim=1)
+            x = x + self.pos_embed
             # temporal pos
             cls_tokens = x[:B, :1, :]
             x = x[:, 1:]
@@ -904,9 +942,7 @@ class PretrainVideoMamba(nn.Module):
             temporal_pos_offset: Start index in temporal tokens (post-tubelet).
             ssm_state: Optional per-layer state (ssm_state or (conv_state, ssm_state)).
         """
-        temporal_tokens = (
-            x.shape[2] if use_image else x.shape[2] // self.patch_embed.tubelet_size
-        )
+        temporal_tokens = x.shape[2] // self.patch_embed.tubelet_size
         features = self.forward_features(
             x,
             mask,
@@ -999,7 +1035,12 @@ class PretrainVideoMamba(nn.Module):
 
 def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
     logger.info(f"Loading pretrained weights from {pretrained_path}")
-    checkpoint_model = torch.load(pretrained_path, map_location="cpu")
+    try:
+        checkpoint_model = torch.load(
+            pretrained_path, map_location="cpu", weights_only=True
+        )
+    except TypeError:
+        checkpoint_model = torch.load(pretrained_path, map_location="cpu")
     if not isinstance(checkpoint_model, dict):
         raise TypeError("Expected a plain state_dict (dict) checkpoint.")
     if "model" in checkpoint_model or "module" in checkpoint_model:

@@ -6,7 +6,9 @@ import torch
 
 from models.mask import RandomMaskingGenerator, TubeMaskingGenerator
 from models.videomamba import build_videomamba
-from models.videomamba.videomamba import PretrainVideoMamba
+from models.videomamba.mamba_simple import Mamba
+from models.videomamba.videomamba import PretrainVideoMamba, create_block, load_state_dict
+import models.videomamba.videomamba as videomamba_module
 
 
 def _small_model(**overrides):
@@ -152,6 +154,23 @@ def test_build_videomamba_requires_channels_attr(tmp_path):
         build_videomamba(cfg)
 
 
+def test_load_state_dict_uses_weights_only(tmp_path, monkeypatch):
+    model = _small_model()
+    ckpt_path = tmp_path / "mini_ckpt.pt"
+    torch.save(model.state_dict(), ckpt_path)
+
+    seen_kwargs: dict[str, Any] = {}
+    original_load = videomamba_module.torch.load
+
+    def _wrapped_load(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(videomamba_module.torch, "load", _wrapped_load)
+    load_state_dict(str(ckpt_path), model, ckpt_num_frame=4, num_frames=4)
+    assert seen_kwargs.get("weights_only") is True
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
 def test_clip_return_layer_zero_no_longer_crashes():
     model = _small_model(clip_return_layer=0).cuda().eval()
@@ -222,3 +241,84 @@ def test_clip_return_layer_gt_one_final_tap_matches_normalized_output():
     assert x_clip_vis is not None
     assert x_clip_vis.shape[0] == 2
     torch.testing.assert_close(x_clip_vis[-1], x_vis, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_use_image_multiframe_masked_path_keeps_batch_dimension():
+    model = _small_model().cuda().eval()
+    x = torch.randn(2, 3, 3, 8, 8, device="cuda")
+    mask = torch.zeros(2, 1 + 3 * 2 * 2, dtype=torch.bool, device="cuda")
+
+    with torch.no_grad():
+        x_vis_unmasked, x_pool_unmasked, _ = model(x, mask=None, use_image=True)
+        x_vis_masked, x_pool_masked, x_clip = model(x, mask=mask, use_image=True)
+
+    assert x_vis_unmasked.shape == (2, 3 * 2 * 2, model.embed_dim)
+    assert x_pool_unmasked.shape[0] == 2
+    assert x_vis_masked.shape == (2, 3 * 2 * 2, model.embed_dim)
+    assert x_pool_masked.shape[0] == 2
+    assert x_clip is not None
+    assert x_clip.shape[1] == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_use_image_mask_length_uses_post_tubelet_temporal_tokens():
+    model = _small_model(kernel_size=2, num_frames=4).cuda().eval()
+    x = torch.randn(1, 3, 4, 8, 8, device="cuda")
+    temporal_tokens = x.shape[2] // model.patch_embed.tubelet_size
+    mask = torch.zeros(
+        1, 1 + temporal_tokens * model.patch_embed.num_patches, dtype=torch.bool, device="cuda"
+    )
+
+    with torch.no_grad():
+        x_vis, x_pool, x_clip = model(x, mask=mask, use_image=True)
+
+    assert x_vis.shape == (1, temporal_tokens * model.patch_embed.num_patches, model.embed_dim)
+    assert x_pool.shape == (1, 1, model.embed_dim)
+    assert x_clip is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_inference_cache_resizes_when_batch_size_changes():
+    model = Mamba(
+        d_model=8,
+        d_state=4,
+        d_conv=2,
+        expand=2,
+        use_fast_path=False,
+        layer_idx=0,
+    ).cuda().eval()
+    cache = SimpleNamespace(seqlen_offset=0, key_value_memory_dict={})
+
+    with torch.no_grad():
+        out_a = model(torch.randn(2, 1, 8, device="cuda"), inference_params=cache)
+        cache.seqlen_offset = 1
+        out_b = model(torch.randn(1, 1, 8, device="cuda"), inference_params=cache)
+
+    conv_state, ssm_state = cache.key_value_memory_dict[0]
+    assert out_a.shape == (2, 1, 8)
+    assert out_b.shape == (1, 1, 8)
+    assert conv_state.shape[0] == 1
+    assert ssm_state.shape[0] == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_block_return_state_flag_is_respected():
+    block = create_block(
+        d_model=16,
+        ssm_cfg={"use_fast_path": False},
+        rms_norm=False,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        bimamba=True,
+        layer_idx=0,
+    ).cuda()
+    x = torch.randn(2, 3, 16, device="cuda")
+    state = block.mixer.allocate_state(batch_size=2, dtype=x.dtype, device=x.device)
+
+    with torch.no_grad():
+        out_without_state = block(x, state=state, return_state=False)
+        out_with_state = block(x, state=state, return_state=True)
+
+    assert len(out_without_state) == 2
+    assert len(out_with_state) == 3

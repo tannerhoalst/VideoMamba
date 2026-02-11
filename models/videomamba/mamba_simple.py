@@ -541,7 +541,7 @@ class Mamba(nn.Module):
         initialize_states: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         assert self.layer_idx is not None
-        if self.layer_idx not in inference_params.key_value_memory_dict:
+        def _allocate_states() -> Tuple[Tensor, Tensor]:
             conv_state = torch.zeros(
                 batch_size,
                 self.d_model * self.expand,
@@ -557,6 +557,10 @@ class Mamba(nn.Module):
                 dtype=self.dt_proj.weight.dtype,
                 # dtype=torch.float32,
             )
+            return conv_state, ssm_state
+
+        if self.layer_idx not in inference_params.key_value_memory_dict:
+            conv_state, ssm_state = _allocate_states()
             inference_params.key_value_memory_dict[self.layer_idx] = (
                 conv_state,
                 ssm_state,
@@ -565,8 +569,13 @@ class Mamba(nn.Module):
             conv_state, ssm_state = inference_params.key_value_memory_dict[
                 self.layer_idx
             ]
-            # TODO: What if batch size changes between generation, and we reuse the same states?
-            if initialize_states:
+            if conv_state.shape[0] != batch_size or ssm_state.shape[0] != batch_size:
+                conv_state, ssm_state = _allocate_states()
+                inference_params.key_value_memory_dict[self.layer_idx] = (
+                    conv_state,
+                    ssm_state,
+                )
+            elif initialize_states:
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
