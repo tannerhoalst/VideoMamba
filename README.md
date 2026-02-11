@@ -53,6 +53,11 @@ model = build_videomamba(config)
 
 For more details on arguments and outputs, see `models/videomamba/videomamba.py`.
 
+Strict config/checkpoint contract:
+- `vision_encoder.channels` is required (no `in_chans` fallback).
+- Pretrained checkpoints must be plain `state_dict` files (no `{"model": ...}` / `{"module": ...}` wrapper).
+- If `pretrained` is set, `vision_encoder.ckpt_num_frame` must be provided.
+
 ## Streaming training
 
 Chunked training can carry differentiable Mamba state across windows. State is a

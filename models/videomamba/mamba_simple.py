@@ -206,6 +206,10 @@ class Mamba(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else int(dt_rank)
+        if not bimamba:
+            raise NotImplementedError(
+                "This minimal VideoMamba package only supports bimamba=True."
+            )
         disable_fused = os.getenv("VIDEOMAMBA_DISABLE_FUSED", "").lower()
         if disable_fused in {"1", "true", "yes", "y", "on"}:
             use_fast_path = False

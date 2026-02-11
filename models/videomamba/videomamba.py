@@ -139,14 +139,24 @@ class Block(nn.Module):
                 hidden_states, new_state = cast(
                     Tuple[Tensor, Tuple[Tensor, Tensor]],
                     checkpoint.checkpoint(
-                        self.mixer, hidden_states, inference_params, None, state, True
+                        self.mixer,
+                        hidden_states,
+                        inference_params,
+                        None,
+                        state,
+                        True,
+                        use_reentrant=False,
                     ),
                 )
             else:
                 hidden_states = cast(
                     Tensor,
                     checkpoint.checkpoint(
-                        self.mixer, hidden_states, inference_params, ssm_state
+                        self.mixer,
+                        hidden_states,
+                        inference_params,
+                        ssm_state,
+                        use_reentrant=False,
                     ),
                 )
         else:
@@ -347,6 +357,41 @@ def get_sinusoid_encoding_table(n_position, d_hid):
     ).unsqueeze(0)
 
 
+def get_sinusoid_encoding_table_torch(
+    n_position: int,
+    d_hid: int,
+    offset: int = 0,
+    device: Optional[torch.device] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> Tensor:
+    if n_position <= 0:
+        raise ValueError("n_position must be positive.")
+    if d_hid <= 0:
+        raise ValueError("d_hid must be positive.")
+    if offset < 0:
+        raise ValueError("offset must be non-negative.")
+    angles = (
+        torch.arange(offset, offset + n_position, device=device, dtype=torch.float32)
+        .unsqueeze(1)
+        .div(
+            torch.pow(
+                10000.0,
+                (
+                    2
+                    * torch.floor(
+                        torch.arange(d_hid, device=device, dtype=torch.float32) / 2
+                    )
+                    / d_hid
+                ),
+            )
+        )
+    )
+    sinusoid_table = torch.empty_like(angles)
+    sinusoid_table[:, 0::2] = torch.sin(angles[:, 0::2])
+    sinusoid_table[:, 1::2] = torch.cos(angles[:, 1::2])
+    return sinusoid_table.unsqueeze(0).to(dtype=torch.float32 if dtype is None else dtype)
+
+
 class PretrainVideoMamba(nn.Module):
     def __init__(
         self,
@@ -373,12 +418,11 @@ class PretrainVideoMamba(nn.Module):
         use_checkpoint: bool = False,
         checkpoint_num: int = 0,
         # clip,
-        clip_decoder_embed_dim: int = 768,
+        clip_decoder_embed_dim: Optional[int] = None,
         clip_output_dim: int = 512,
         clip_return_layer: int = 1,
         clip_student_return_interval: int = 1,
         add_pool_norm: bool = True,
-        in_chans: Optional[int] = None,
     ):
         factory_kwargs: Dict[str, object] = {}  # follow MambaLMHeadModel
         if device is not None:
@@ -386,16 +430,31 @@ class PretrainVideoMamba(nn.Module):
         if dtype is not None:
             factory_kwargs["dtype"] = dtype
         super().__init__()
-        input_channels = channels if in_chans is None else in_chans
+        if not bimamba:
+            raise NotImplementedError(
+                "This minimal VideoMamba package only supports bimamba=True."
+            )
+        if clip_return_layer < 0:
+            raise ValueError("clip_return_layer must be >= 0.")
+        if clip_student_return_interval <= 0:
+            raise ValueError("clip_student_return_interval must be > 0.")
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
         self.use_checkpoint = use_checkpoint
         self.checkpoint_num = checkpoint_num
+        self.clip_decoder_embed_dim = (
+            embed_dim if clip_decoder_embed_dim is None else clip_decoder_embed_dim
+        )
         logger.info(f"Use checkpoint: {use_checkpoint}")
         logger.info(f"Checkpoint number: {checkpoint_num}")
         self.return_index = []
         for i in range(clip_return_layer):
-            self.return_index.append(depth - int(i * clip_student_return_interval) - 1)
+            layer_index = depth - int(i * clip_student_return_interval) - 1
+            if layer_index < 0:
+                raise ValueError(
+                    "clip_return_layer and clip_student_return_interval exceed model depth."
+                )
+            self.return_index.append(layer_index)
         logger.info(f"Student return index: {self.return_index}")
         self.depth = depth
         self.pool_type = pool_type
@@ -410,7 +469,7 @@ class PretrainVideoMamba(nn.Module):
             img_size=img_size,
             patch_size=patch_size,
             kernel_size=kernel_size,
-            in_chans=input_channels,
+            in_chans=channels,
             embed_dim=embed_dim,
         )
         num_patches = self.patch_embed.num_patches
@@ -420,6 +479,15 @@ class PretrainVideoMamba(nn.Module):
         self.temporal_pos_embedding = nn.Parameter(
             torch.zeros(1, num_frames // kernel_size, embed_dim)
         )
+        self.clip_input_proj: nn.Module
+        if self.clip_decoder_embed_dim == embed_dim:
+            self.clip_input_proj = nn.Identity()
+        else:
+            self.clip_input_proj = nn.Linear(
+                embed_dim,
+                self.clip_decoder_embed_dim,
+                **cast(Dict[str, Any], factory_kwargs),
+            )
 
         dpr = [
             x.item() for x in torch.linspace(0, drop_path_rate, depth)
@@ -460,7 +528,7 @@ class PretrainVideoMamba(nn.Module):
             [
                 Linear_Decoder(
                     output_dim=clip_output_dim,
-                    embed_dim=clip_decoder_embed_dim,
+                    embed_dim=self.clip_decoder_embed_dim,
                     norm_layer=nn.LayerNorm,
                 )
                 for _ in range(clip_return_layer)
@@ -468,10 +536,10 @@ class PretrainVideoMamba(nn.Module):
         )
 
         self.clip_pos_embed = get_sinusoid_encoding_table(
-            num_patches * num_frames // kernel_size + 1, clip_decoder_embed_dim
+            num_patches * num_frames // kernel_size + 1, self.clip_decoder_embed_dim
         )
         self.clip_img_pos_embed = get_sinusoid_encoding_table(
-            num_patches + 1, clip_decoder_embed_dim
+            num_patches + 1, self.clip_decoder_embed_dim
         )
 
         self.add_pool_norm = add_pool_norm
@@ -591,6 +659,64 @@ class PretrainVideoMamba(nn.Module):
         pos = pos.permute(0, 2, 1).to(dtype=dtype)
         return pos[:, offset:end]
 
+    def _normalize_mask(
+        self, mask: Optional[Tensor], batch_size: int, token_count: int, device: torch.device
+    ) -> Optional[Tensor]:
+        if mask is None:
+            return None
+        if mask.ndim != 2:
+            raise ValueError("mask must be 2D with shape [B, N].")
+        if mask.shape[0] != batch_size:
+            raise ValueError(
+                f"mask batch size mismatch: expected {batch_size}, got {mask.shape[0]}."
+            )
+        mask = mask.to(device=device, dtype=torch.bool)
+        if mask.shape[1] != token_count:
+            raise ValueError(
+                f"mask token length mismatch: expected {token_count}, got {mask.shape[1]}."
+            )
+        return mask
+
+    def _get_clip_pos_embedding(
+        self,
+        batch_size: int,
+        temporal_tokens: int,
+        use_image: bool,
+        temporal_pos_offset: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        if use_image:
+            expected_tokens = self.patch_embed.num_patches + 1
+            pos_embed = self.clip_img_pos_embed.to(device=device, dtype=dtype)
+            if expected_tokens > pos_embed.shape[1]:
+                pos_embed = get_sinusoid_encoding_table_torch(
+                    expected_tokens,
+                    self.clip_decoder_embed_dim,
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                pos_embed = pos_embed[:, :expected_tokens]
+            return pos_embed.repeat(batch_size, 1, 1)
+
+        if temporal_pos_offset < 0:
+            raise ValueError("temporal_pos_offset must be non-negative.")
+        tokens_per_frame = self.patch_embed.num_patches
+        start_token = 1 + temporal_pos_offset * tokens_per_frame
+        end_token = start_token + temporal_tokens * tokens_per_frame
+        pos_embed = self.clip_pos_embed.to(device=device, dtype=dtype)
+        if end_token > pos_embed.shape[1]:
+            pos_embed = get_sinusoid_encoding_table_torch(
+                end_token,
+                self.clip_decoder_embed_dim,
+                device=device,
+                dtype=dtype,
+            )
+        cls_token = pos_embed[:, :1]
+        spatial_tokens = pos_embed[:, start_token:end_token]
+        return torch.cat([cls_token, spatial_tokens], dim=1).repeat(batch_size, 1, 1)
+
     def forward_features(
         self,
         x: Tensor,
@@ -599,8 +725,8 @@ class PretrainVideoMamba(nn.Module):
         ssm_state: Optional[StateCollection] = None,
         temporal_pos_offset: int = 0,
     ) -> Union[
-        Tuple[Tensor, Tensor],
-        Tuple[Tensor, Tensor, StateCollection],
+        Tuple[Tensor, Optional[Tensor]],
+        Tuple[Tensor, Optional[Tensor], StateCollection],
     ]:
         """Forward features with temporal position slicing.
 
@@ -634,6 +760,7 @@ class PretrainVideoMamba(nn.Module):
             x = torch.cat((cls_tokens, x), dim=1)
 
         # mask
+        mask = self._normalize_mask(mask, B, x.shape[1], x.device)
         if mask is not None:
             x_vis = x[~mask].reshape(B, -1, C)  # ~mask means visible
         else:
@@ -732,7 +859,7 @@ class PretrainVideoMamba(nn.Module):
             x_clip_vis_list.append(residual)
 
         x_vis = hidden_states
-        x_clip_vis = torch.stack(x_clip_vis_list)
+        x_clip_vis = torch.stack(x_clip_vis_list) if x_clip_vis_list else None
 
         if new_states is not None and return_tuple_state:
             maybe_states = cast(List[Optional[LayerState]], new_states)
@@ -775,7 +902,9 @@ class PretrainVideoMamba(nn.Module):
             temporal_pos_offset: Start index in temporal tokens (post-tubelet).
             ssm_state: Optional per-layer state (ssm_state or (conv_state, ssm_state)).
         """
-        T = x.shape[2]
+        temporal_tokens = (
+            x.shape[2] if use_image else x.shape[2] // self.patch_embed.tubelet_size
+        )
         features = self.forward_features(
             x,
             mask,
@@ -784,31 +913,28 @@ class PretrainVideoMamba(nn.Module):
             temporal_pos_offset=temporal_pos_offset,
         )  # [B, N_vis, C_e]
         if ssm_state is None:
-            x_vis, x_clip_vis = cast(Tuple[Tensor, Tensor], features)
+            x_vis, x_clip_vis = cast(Tuple[Tensor, Optional[Tensor]], features)
         else:
             x_vis, x_clip_vis, ssm_state = cast(
-                Tuple[Tensor, Tensor, StateCollection], features
+                Tuple[Tensor, Optional[Tensor], StateCollection], features
             )
 
         # align CLIP:
-        if mask is not None and len(x_clip_vis) > 0:
-            K, B, _, C_CLIP = x_clip_vis.shape
-            if use_image:
-                expand_clip_pos_embed = (
-                    self.clip_img_pos_embed.repeat(B, 1, 1)
-                    .type_as(x)
-                    .to(x.device)
-                    .clone()
-                    .detach()
-                )
-            else:
-                expand_clip_pos_embed = (
-                    self.clip_pos_embed.repeat(B, 1, 1)
-                    .type_as(x)
-                    .to(x.device)
-                    .clone()
-                    .detach()
-                )
+        if mask is not None and x_clip_vis is not None and x_clip_vis.shape[0] > 0:
+            K, B, _, _ = x_clip_vis.shape
+            full_token_count = 1 + temporal_tokens * self.patch_embed.num_patches
+            mask = self._normalize_mask(mask, B, full_token_count, x.device)
+            assert mask is not None
+            x_clip_vis = cast(Tensor, self.clip_input_proj(x_clip_vis))
+            C_CLIP = x_clip_vis.shape[-1]
+            expand_clip_pos_embed = self._get_clip_pos_embedding(
+                batch_size=B,
+                temporal_tokens=temporal_tokens,
+                use_image=use_image,
+                temporal_pos_offset=temporal_pos_offset,
+                dtype=x_clip_vis.dtype,
+                device=x.device,
+            )
             clip_pos_emd_vis = (
                 expand_clip_pos_embed[~mask]
                 .view(B, -1, C_CLIP)
@@ -833,18 +959,21 @@ class PretrainVideoMamba(nn.Module):
                     B, _, C_CLIP = x_vis.shape
                     if self.pool_type == "cls+avg":
                         x_pool_vis = self.pool_norm(
-                            x_vis_cls + x_vis.view(B, T, -1, C_CLIP).mean(2)
+                            x_vis_cls + x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
                         )
                     elif self.pool_type == "cls_cat_avg":
                         x_pool_vis = self.pool_norm(
                             torch.cat(
-                                [x_vis_cls + x_vis.view(B, T, -1, C_CLIP).mean(2)],
+                                [
+                                    x_vis_cls
+                                    + x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
+                                ],
                                 dim=1,
                             )
                         )
                     elif self.pool_type == "avg":
                         x_pool_vis = self.pool_norm(
-                            x_vis.view(B, T, -1, C_CLIP).mean(2)
+                            x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
                         )
                     else:
                         raise ValueError(f"Unsupported pool_type: {self.pool_type}")
@@ -874,11 +1003,13 @@ class PretrainVideoMamba(nn.Module):
 def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
     logger.info(f"Loading pretrained weights from {pretrained_path}")
     checkpoint_model = torch.load(pretrained_path, map_location="cpu")
-    for model_key in ["model", "module"]:
-        if model_key in checkpoint_model:
-            checkpoint_model = checkpoint_model[model_key]
-            logger.info(f"Load state_dict by model_key = {model_key}")
-            break
+    if not isinstance(checkpoint_model, dict):
+        raise TypeError("Expected a plain state_dict (dict) checkpoint.")
+    if "model" in checkpoint_model or "module" in checkpoint_model:
+        raise ValueError(
+            "Checkpoint wrapper keys ('model'/'module') are not supported. "
+            "Pass a plain state_dict checkpoint."
+        )
 
     pos_embed_checkpoint = checkpoint_model["pos_embed"]
     embedding_size = pos_embed_checkpoint.shape[-1]  # channel dim
@@ -913,6 +1044,10 @@ def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
 
     # we use 8 frames for pretraining
     temporal_pos_embed = checkpoint_model["temporal_pos_embedding"]
+    if ckpt_num_frame is None or ckpt_num_frame <= 0:
+        raise ValueError(
+            "ckpt_num_frame must be a positive integer when loading pretrained weights."
+        )
     orig_t_size = ckpt_num_frame // model.patch_embed.tubelet_size
     new_t_size = num_frames // model.patch_embed.tubelet_size
     # height (== width) for the checkpoint position embedding
@@ -925,47 +1060,64 @@ def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
         temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)
         checkpoint_model["temporal_pos_embedding"] = temporal_pos_embed
 
-    msg = model.load_state_dict(checkpoint_model, strict=False)
+    msg = model.load_state_dict(checkpoint_model, strict=True)
     logger.info(msg)
 
 
 def build_videomamba(config, add_pool_norm=True):
-    channels = getattr(config.vision_encoder, "channels", None)
-    if channels is None:
-        channels = getattr(config.vision_encoder, "in_chans", None)
-    if channels is None:
-        channels = 3
+    vision_cfg = config.vision_encoder
+    channels = vision_cfg.channels
+    img_size = vision_cfg.img_size
+    patch_size = vision_cfg.patch_size
+    depth = vision_cfg.depth
+    embed_dim = vision_cfg.embed_dim
+    drop_path_rate = vision_cfg.drop_path_rate
+    ssm_cfg = vision_cfg.ssm_cfg
+    norm_epsilon = vision_cfg.norm_epsilon
+    fused_add_norm = vision_cfg.fused_add_norm
+    rms_norm = vision_cfg.rms_norm
+    residual_in_fp32 = vision_cfg.residual_in_fp32
+    bimamba = vision_cfg.bimamba
+    pool_type = vision_cfg.pool_type
+    kernel_size = vision_cfg.kernel_size
+    num_frames = vision_cfg.num_frames
+    use_checkpoint = vision_cfg.use_checkpoint
+    checkpoint_num = vision_cfg.checkpoint_num
+    clip_output_dim = vision_cfg.clip_output_dim
+    clip_return_layer = vision_cfg.clip_return_layer
+    clip_student_return_interval = vision_cfg.clip_student_return_interval
     model = PretrainVideoMamba(
-        img_size=config.vision_encoder.img_size,
-        patch_size=config.vision_encoder.patch_size,
-        depth=config.vision_encoder.depth,
-        embed_dim=config.vision_encoder.embed_dim,
-        in_chans=channels,
-        drop_path_rate=config.vision_encoder.drop_path_rate,
-        ssm_cfg=config.vision_encoder.ssm_cfg,
-        norm_epsilon=config.vision_encoder.norm_epsilon,
-        fused_add_norm=config.vision_encoder.fused_add_norm,
-        rms_norm=config.vision_encoder.rms_norm,
-        residual_in_fp32=config.vision_encoder.residual_in_fp32,
-        bimamba=config.vision_encoder.bimamba,
-        pool_type=config.vision_encoder.pool_type,
-        kernel_size=config.vision_encoder.kernel_size,
-        num_frames=config.vision_encoder.num_frames,
-        use_checkpoint=config.vision_encoder.use_checkpoint,
-        checkpoint_num=config.vision_encoder.checkpoint_num,
-        clip_decoder_embed_dim=config.vision_encoder.clip_decoder_embed_dim,
-        clip_output_dim=config.vision_encoder.clip_output_dim,
-        clip_return_layer=config.vision_encoder.clip_return_layer,
-        clip_student_return_interval=config.vision_encoder.clip_student_return_interval,
+        img_size=img_size,
+        patch_size=patch_size,
+        depth=depth,
+        embed_dim=embed_dim,
+        channels=channels,
+        drop_path_rate=drop_path_rate,
+        ssm_cfg=ssm_cfg,
+        norm_epsilon=norm_epsilon,
+        fused_add_norm=fused_add_norm,
+        rms_norm=rms_norm,
+        residual_in_fp32=residual_in_fp32,
+        bimamba=bimamba,
+        pool_type=pool_type,
+        kernel_size=kernel_size,
+        num_frames=num_frames,
+        use_checkpoint=use_checkpoint,
+        checkpoint_num=checkpoint_num,
+        clip_decoder_embed_dim=vision_cfg.clip_decoder_embed_dim,
+        clip_output_dim=clip_output_dim,
+        clip_return_layer=clip_return_layer,
+        clip_student_return_interval=clip_student_return_interval,
         add_pool_norm=add_pool_norm,
     )
     object.__setattr__(model, "default_cfg", _cfg())
-    if config.vision_encoder.pretrained is not None:
+    pretrained_path = vision_cfg.pretrained
+    if pretrained_path is not None:
         load_state_dict(
-            pretrained_path=config.vision_encoder.pretrained,
+            pretrained_path=pretrained_path,
             model=model,
-            ckpt_num_frame=config.vision_encoder.get("ckpt_num_frame", -1),
-            num_frames=config.vision_encoder.num_frames,
+            ckpt_num_frame=vision_cfg.ckpt_num_frame,
+            num_frames=num_frames,
         )
     else:
         logger.info("No pretrained weights!!!")
