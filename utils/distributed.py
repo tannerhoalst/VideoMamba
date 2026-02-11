@@ -1,11 +1,30 @@
 import logging
 import os
+import re
 
-import deepspeed
 import torch
 import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
+
+try:
+    import deepspeed
+except Exception:
+    deepspeed = None
+
+
+def _parse_slurm_tasks_per_node(spec: str) -> int:
+    """Parse SLURM_TASKS_PER_NODE (e.g. '8', '16(x2),8') into total task count."""
+    total = 0
+    for chunk in spec.split(","):
+        value = chunk.strip()
+        match = re.fullmatch(r"(\d+)(?:\(x(\d+)\))?", value)
+        if match is None:
+            raise ValueError(f"Unsupported SLURM_TASKS_PER_NODE value: {spec}")
+        tasks = int(match.group(1))
+        repeats = int(match.group(2)) if match.group(2) is not None else 1
+        total += tasks * repeats
+    return total
 
 
 def setup_for_distributed(is_master):
@@ -72,12 +91,12 @@ def init_distributed_mode(args):
         # local rank on the current node / global rank
         local_rank = int(os.environ["SLURM_LOCALID"])
         global_rank = int(os.environ["SLURM_PROCID"])
-        # number of processes / GPUs per node
-        world_size = int(os.environ["SLURM_NNODES"]) * int(
-            os.environ["SLURM_TASKS_PER_NODE"][0]
-        )
-
-        print(world_size)
+        if "SLURM_NTASKS" in os.environ:
+            world_size = int(os.environ["SLURM_NTASKS"])
+        elif "SLURM_TASKS_PER_NODE" in os.environ:
+            world_size = _parse_slurm_tasks_per_node(os.environ["SLURM_TASKS_PER_NODE"])
+        else:
+            world_size = int(os.environ["SLURM_NNODES"])
 
         args.rank = global_rank
         args.gpu = local_rank
@@ -103,6 +122,11 @@ def init_distributed_mode(args):
         logger.info(f"SLURM_JOB_ID {os.environ['SLURM_JOB_ID']}")
 
     if hasattr(args, "deepspeed") and args.deepspeed.enable:
+        if deepspeed is None:
+            raise ImportError(
+                "deepspeed is not installed. Install optional training dependencies with "
+                "`pip install -e .[training]`."
+            )
         deepspeed.init_distributed(
             dist_backend=args.dist_backend,
             init_method=args.dist_url,

@@ -7,13 +7,16 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 pip install -U pip setuptools wheel
-pip install -U torch  # install a stable CUDA/CPU wheel that matches your environment
+pip install -U torch  # install a stable CUDA wheel that matches your environment
 pip install -e .
 ```
 
 This repository contains a minimal VideoMamba video encoder backbone for use in
 other projects. Training scripts, datasets, and alternative backbones have been
 removed to keep the package lightweight.
+
+CUDA requirement: this minimal package uses `causal-conv1d` CUDA kernels and
+does not provide a CPU inference/training fallback.
 
 ## Usage
 

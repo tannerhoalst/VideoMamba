@@ -9,6 +9,7 @@ from models.videomamba import build_videomamba
 from models.videomamba.mamba_simple import Mamba
 from models.videomamba.videomamba import PretrainVideoMamba, create_block, load_state_dict
 import models.videomamba.videomamba as videomamba_module
+from utils.distributed import _parse_slurm_tasks_per_node
 
 
 def _small_model(**overrides):
@@ -171,6 +172,25 @@ def test_load_state_dict_uses_weights_only(tmp_path, monkeypatch):
     assert seen_kwargs.get("weights_only") is True
 
 
+def test_mamba_forward_requires_cuda_tensor_inputs():
+    model = Mamba(
+        d_model=8,
+        d_state=4,
+        d_conv=2,
+        expand=2,
+        use_fast_path=False,
+        layer_idx=0,
+    ).eval()
+    with pytest.raises(RuntimeError, match="requires CUDA tensors"):
+        model(torch.randn(1, 2, 8))
+
+
+def test_parse_slurm_tasks_per_node():
+    assert _parse_slurm_tasks_per_node("8") == 8
+    assert _parse_slurm_tasks_per_node("16(x2)") == 32
+    assert _parse_slurm_tasks_per_node("16(x2),8") == 40
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
 def test_clip_return_layer_zero_no_longer_crashes():
     model = _small_model(clip_return_layer=0).cuda().eval()
@@ -259,6 +279,18 @@ def test_use_image_multiframe_masked_path_keeps_batch_dimension():
     assert x_pool_masked.shape[0] == 2
     assert x_clip is not None
     assert x_clip.shape[1] == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_masked_forward_rejects_variable_visible_token_counts():
+    model = _small_model().cuda().eval()
+    x = torch.randn(2, 3, 4, 8, 8, device="cuda")
+    mask = torch.zeros(2, 1 + 4 * 2 * 2, dtype=torch.bool, device="cuda")
+    mask[0, 3:7] = True
+    mask[1, 3:11] = True
+
+    with pytest.raises(ValueError, match="same number of visible tokens"):
+        model(x, mask=mask, use_image=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")

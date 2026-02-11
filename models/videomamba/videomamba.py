@@ -707,6 +707,32 @@ class PretrainVideoMamba(nn.Module):
             )
         return mask
 
+    def _visible_token_positions(
+        self, mask: Optional[Tensor], batch_size: int, token_count: int, device: torch.device
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        """Normalize mask and return visible token indices per sample."""
+        normalized_mask = self._normalize_mask(mask, batch_size, token_count, device)
+        if normalized_mask is None:
+            return None, None
+
+        visible_mask = ~normalized_mask
+        visible_counts = visible_mask.sum(dim=1)
+        if visible_counts.numel() > 0 and not torch.all(visible_counts == visible_counts[0]):
+            raise ValueError(
+                "mask must keep the same number of visible tokens per sample; "
+                f"got per-sample counts: {visible_counts.tolist()}."
+            )
+        if visible_counts.numel() > 0 and int(visible_counts[0].item()) <= 0:
+            raise ValueError("mask must keep at least one visible token per sample.")
+
+        token_positions = torch.arange(token_count, device=device).unsqueeze(0).expand(
+            batch_size, -1
+        )
+        token_positions = token_positions.masked_fill(~visible_mask, token_count)
+        num_visible = int(visible_counts[0].item()) if visible_counts.numel() > 0 else 0
+        visible_positions = torch.sort(token_positions, dim=1).values[:, :num_visible]
+        return normalized_mask, visible_positions
+
     def _get_clip_pos_embedding(
         self,
         batch_size: int,
@@ -798,9 +824,9 @@ class PretrainVideoMamba(nn.Module):
             x = torch.cat((cls_tokens, x), dim=1)
 
         # mask
-        mask = self._normalize_mask(mask, B, x.shape[1], x.device)
-        if mask is not None:
-            x_vis = x[~mask].reshape(B, -1, C)  # ~mask means visible
+        mask, visible_positions = self._visible_token_positions(mask, B, x.shape[1], x.device)
+        if visible_positions is not None:
+            x_vis = x.gather(1, visible_positions.unsqueeze(-1).expand(-1, -1, C))
         else:
             x_vis = x
         x_clip_vis_list: List[Tensor] = []
@@ -961,8 +987,11 @@ class PretrainVideoMamba(nn.Module):
         if mask is not None and x_clip_vis is not None and x_clip_vis.shape[0] > 0:
             K, B, _, _ = x_clip_vis.shape
             full_token_count = 1 + temporal_tokens * self.patch_embed.num_patches
-            mask = self._normalize_mask(mask, B, full_token_count, x.device)
+            mask, visible_positions = self._visible_token_positions(
+                mask, B, full_token_count, x.device
+            )
             assert mask is not None
+            assert visible_positions is not None
             x_clip_vis = cast(Tensor, self.clip_input_proj(x_clip_vis))
             C_CLIP = x_clip_vis.shape[-1]
             expand_clip_pos_embed = self._get_clip_pos_embedding(
@@ -973,12 +1002,9 @@ class PretrainVideoMamba(nn.Module):
                 dtype=x_clip_vis.dtype,
                 device=x.device,
             )
-            clip_pos_emd_vis = (
-                expand_clip_pos_embed[~mask]
-                .view(B, -1, C_CLIP)
-                .unsqueeze(0)
-                .repeat(K, 1, 1, 1)
-            )
+            clip_pos_emd_vis = expand_clip_pos_embed.gather(
+                1, visible_positions.unsqueeze(-1).expand(-1, -1, C_CLIP)
+            ).unsqueeze(0).repeat(K, 1, 1, 1)
             x_clip_full = x_clip_vis + clip_pos_emd_vis  # [K, B, N, C_d_clip]
 
             x_clip = []

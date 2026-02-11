@@ -302,6 +302,11 @@ class Mamba(nn.Module):
             raise ValueError("Pass either state or ssm_state, not both.")
         if inference_params is not None and state is not None:
             raise ValueError("state is not supported with inference_params.")
+        if not hidden_states.is_cuda:
+            raise RuntimeError(
+                "VideoMamba requires CUDA tensors in this package because "
+                "causal-conv1d kernels are CUDA-only."
+            )
 
         batch, seqlen, dim = hidden_states.shape
 
@@ -449,6 +454,11 @@ class Mamba(nn.Module):
     def step(
         self, hidden_states: Tensor, conv_state: Tensor, ssm_state: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor]:
+        if not hidden_states.is_cuda:
+            raise RuntimeError(
+                "VideoMamba requires CUDA tensors in this package because "
+                "causal-conv1d kernels are CUDA-only."
+            )
         assert (
             hidden_states.shape[1] == 1
         ), "Only support decoding with 1 token at a time for now"
