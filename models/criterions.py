@@ -6,7 +6,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from models.utils import allgather_wgrad
-from utils.distributed import get_rank, get_world_size, is_dist_avail_and_initialized
+from utils.distributed import (
+    gather_tensor_along_batch,
+    gather_tensor_along_batch_with_backward,
+    get_rank,
+    get_world_size,
+    is_dist_avail_and_initialized,
+)
 from utils.easydict import EasyDict
 
 logger = logging.getLogger(__name__)
@@ -62,6 +68,8 @@ class VTC_VTM_Loss(nn.Module):
     def __init__(self, vtm_hard_neg):
         super().__init__()
         self.vtm_hard_neg = vtm_hard_neg
+        self._warned_vtm_batch_lt2 = False
+        self._warned_vtm_no_negative = False
 
     def vtc_loss(
         self,
@@ -116,6 +124,7 @@ class VTC_VTM_Loss(nn.Module):
         text_proj: torch.Tensor,
         text_atts: torch.Tensor,
         idx: torch.Tensor,
+        all_gather: bool = True,
     ):
         """video-text matching loss.
 
@@ -133,9 +142,34 @@ class VTC_VTM_Loss(nn.Module):
         Returns: TODO
 
         """
+        should_gather = (
+            all_gather and is_dist_avail_and_initialized() and get_world_size() > 1
+        )
+        if should_gather:
+            vision_embeds = cast(
+                torch.Tensor, gather_tensor_along_batch_with_backward(vision_embeds)
+            )
+            text_embeds = cast(
+                torch.Tensor, gather_tensor_along_batch_with_backward(text_embeds)
+            )
+            vision_proj = cast(
+                torch.Tensor, gather_tensor_along_batch_with_backward(vision_proj)
+            )
+            text_proj = cast(
+                torch.Tensor, gather_tensor_along_batch_with_backward(text_proj)
+            )
+            text_atts = cast(torch.Tensor, gather_tensor_along_batch(text_atts))
+            idx = cast(torch.Tensor, gather_tensor_along_batch(idx))
+
         batch_size = vision_embeds.shape[0]
         if batch_size < 2:
-            raise ValueError("vtm_loss requires batch size >= 2 to sample negatives.")
+            if not self._warned_vtm_batch_lt2:
+                logger.warning(
+                    "vtm_loss received <2 samples after optional gather; "
+                    "returning zero loss because no negatives can be formed."
+                )
+                self._warned_vtm_batch_lt2 = True
+            return vision_embeds.sum() * 0.0
 
         with torch.no_grad():
             sim_v2t, sim_t2v = get_sim(vision_proj, text_proj, temp)
@@ -148,9 +182,13 @@ class VTC_VTM_Loss(nn.Module):
             mask = self.get_mask(sim_v2t, idx=idx).bool()
             valid_negatives = ~mask
             if not torch.all(valid_negatives.any(dim=1)):
-                raise ValueError(
-                    "vtm_loss requires at least one negative candidate per sample."
-                )
+                if not self._warned_vtm_no_negative:
+                    logger.warning(
+                        "vtm_loss found samples with no valid negatives after masking; "
+                        "returning zero loss for this batch."
+                    )
+                    self._warned_vtm_no_negative = True
+                return vision_embeds.sum() * 0.0
             weights_v2t.masked_fill_(mask, 0)
             weights_t2v.masked_fill_(mask, 0)
 

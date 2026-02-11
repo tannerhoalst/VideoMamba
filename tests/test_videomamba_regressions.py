@@ -221,23 +221,26 @@ def test_vtc_loss_default_all_gather_path_is_safe_without_distributed():
     torch.testing.assert_close(default_loss, local_loss)
 
 
-def test_vtm_loss_rejects_batch_size_one():
+def test_vtm_loss_batch_size_one_returns_zero_loss():
     loss_module = VTC_VTM_Loss(vtm_hard_neg=True)
     encoder = _DummyMultimodalEncoder()
     vtm_head = torch.nn.Linear(8, 2)
-
-    with pytest.raises(ValueError, match="batch size >= 2"):
-        loss_module.vtm_loss(
-            multimodal_encoder=encoder,
-            vtm_head=vtm_head,
-            temp=0.07,
-            vision_embeds=torch.randn(1, 2, 3, 8),
-            text_embeds=torch.randn(1, 3, 8),
-            vision_proj=torch.randn(1, 2, 8),
-            text_proj=torch.randn(1, 8),
-            text_atts=torch.ones(1, 3, dtype=torch.long),
-            idx=torch.arange(1),
-        )
+    vision_embeds = torch.randn(1, 2, 3, 8, requires_grad=True)
+    loss = loss_module.vtm_loss(
+        multimodal_encoder=encoder,
+        vtm_head=vtm_head,
+        temp=0.07,
+        vision_embeds=vision_embeds,
+        text_embeds=torch.randn(1, 3, 8),
+        vision_proj=torch.randn(1, 2, 8),
+        text_proj=torch.randn(1, 8),
+        text_atts=torch.ones(1, 3, dtype=torch.long),
+        idx=torch.arange(1),
+    )
+    assert loss.shape == ()
+    torch.testing.assert_close(loss.detach(), torch.tensor(0.0))
+    loss.backward()
+    assert vision_embeds.grad is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
