@@ -4,12 +4,13 @@ from typing import Any
 import pytest
 import torch
 
-from models.criterions import VTC_VTM_Loss
+from models.criterions import MLMLoss, VTC_VTM_Loss
 from models.mask import RandomMaskingGenerator, TubeMaskingGenerator
 from models.videomamba import build_videomamba
 from models.videomamba.mamba_simple import Mamba
 import models.videomamba.videomamba as videomamba_module
 from models.videomamba.videomamba import PretrainVideoMamba, create_block, load_state_dict
+from utils.config_utils import setup_deepspeed_zero_config
 from utils.distributed import _parse_slurm_tasks_per_node
 
 
@@ -209,6 +210,11 @@ def test_parse_slurm_tasks_per_node():
     assert _parse_slurm_tasks_per_node("16(x2),8") == 40
 
 
+def test_setup_deepspeed_zero_config_invalid_stage_raises_value_error():
+    with pytest.raises(ValueError, match="Wrong stage for deepspeed 4"):
+        setup_deepspeed_zero_config(4)
+
+
 def test_vtc_loss_default_all_gather_path_is_safe_without_distributed():
     loss_module = VTC_VTM_Loss(vtm_hard_neg=True)
     vision_proj = torch.randn(3, 2, 8)
@@ -243,6 +249,25 @@ def test_vtm_loss_batch_size_one_returns_zero_loss():
     assert vision_embeds.grad is not None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for this regression")
+def test_mlm_mask_accepts_cuda_probability_matrix_without_device_mismatch():
+    tokenizer = SimpleNamespace(pad_token_id=0, cls_token_id=101, mask_token_id=103)
+    loss_module = MLMLoss(masking_prob=0.15, tokenizer=tokenizer)
+    input_ids = torch.tensor([[101, 5, 6, 0], [101, 7, 8, 0]], device="cuda")
+    targets = input_ids.clone()
+    probability_matrix = torch.full(input_ids.shape, 0.15, device="cuda")
+
+    masked_input_ids, masked_targets = loss_module.mask(
+        input_ids=input_ids.clone(),
+        vocab_size=2048,
+        device=input_ids.device,
+        targets=targets,
+        probability_matrix=probability_matrix,
+    )
+    assert masked_input_ids.device.type == "cuda"
+    assert masked_targets.device.type == "cuda"
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
 def test_clip_return_layer_zero_no_longer_crashes():
     model = _small_model(clip_return_layer=0).cuda().eval()
@@ -275,6 +300,16 @@ def test_masked_forward_supports_runtime_temporal_length_mismatch():
     with torch.no_grad():
         _, _, x_clip = model(x, mask=mask, use_image=False)
     assert x_clip is not None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_forward_rejects_frame_count_not_divisible_by_tubelet():
+    model = _small_model(kernel_size=2, num_frames=8).cuda().eval()
+    x = torch.randn(1, 3, 5, 8, 8, device="cuda")
+    with pytest.raises(ValueError, match="must be divisible by tubelet size"):
+        model(x, mask=None, use_image=False)
+    with pytest.raises(ValueError, match="must be divisible by tubelet size"):
+        model.forward_features(x, mask=None, use_image=False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")

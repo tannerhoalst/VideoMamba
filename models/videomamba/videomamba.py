@@ -667,6 +667,16 @@ class PretrainVideoMamba(nn.Module):
             return state[layer_idx]
         raise TypeError("state must be a list, tuple, or dict indexed by layer id")
 
+    def _validate_temporal_length(self, frame_count: int) -> int:
+        tubelet = self.patch_embed.tubelet_size
+        if frame_count <= 0:
+            raise ValueError("Input must contain at least one frame.")
+        if frame_count % tubelet != 0:
+            raise ValueError(
+                f"Input frame count ({frame_count}) must be divisible by tubelet size ({tubelet})."
+            )
+        return frame_count // tubelet
+
     def _get_temporal_pos_embedding(
         self, seqlen: int, offset: int = 0, dtype=None, device=None
     ) -> Tensor:
@@ -843,6 +853,9 @@ class PretrainVideoMamba(nn.Module):
             temporal_pos_offset: Start index in temporal tokens (post-tubelet).
             ssm_state: Optional per-layer state (ssm_state or (conv_state, ssm_state)).
         """
+        if x.ndim != 5:
+            raise ValueError("x must have shape [B, C, T, H, W].")
+        self._validate_temporal_length(x.shape[2])
         x = self.patch_embed(x)
         B, C, T, H, W = x.shape
 
@@ -1019,7 +1032,9 @@ class PretrainVideoMamba(nn.Module):
             temporal_pos_offset: Start index in temporal tokens (post-tubelet).
             ssm_state: Optional per-layer state (ssm_state or (conv_state, ssm_state)).
         """
-        temporal_tokens = x.shape[2] // self.patch_embed.tubelet_size
+        if x.ndim != 5:
+            raise ValueError("x must have shape [B, C, T, H, W].")
+        temporal_tokens = self._validate_temporal_length(x.shape[2])
         features = self.forward_features(
             x,
             mask,

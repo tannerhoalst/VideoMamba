@@ -92,7 +92,7 @@ def setup_deepspeed_zero_config(stage):
         #     "stage3_max_reuse_distance": 1e5,
         # }
 
-    raise ValueError("Wrong stage for deepspeed {}".format(stage.stage))
+    raise ValueError(f"Wrong stage for deepspeed {stage}")
 
 
 def setup_deepspeed_config(config):

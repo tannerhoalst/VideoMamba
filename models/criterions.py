@@ -307,7 +307,9 @@ class MLMLoss(nn.Module):
     ):
         input_ids = text.input_ids.clone()
         labels = input_ids.clone()
-        probability_matrix = torch.full(labels.shape, self.masking_prob)
+        probability_matrix = torch.full(
+            labels.shape, self.masking_prob, device=input_ids.device
+        )
         input_ids, labels = self.mask(
             input_ids,
             text_encoder.config.vocab_size,
@@ -369,10 +371,14 @@ class MLMLoss(nn.Module):
         masked_indices=None,
         probability_matrix=None,
     ):
+        _ = device
         if masked_indices is None:
             if probability_matrix is None:
                 raise ValueError("probability_matrix must be provided when masked_indices is None")
+            probability_matrix = probability_matrix.to(device=input_ids.device)
             masked_indices = torch.bernoulli(probability_matrix).bool()
+        else:
+            masked_indices = masked_indices.to(device=input_ids.device)
 
         masked_indices[input_ids == self.tokenizer.pad_token_id] = False
         masked_indices[input_ids == self.tokenizer.cls_token_id] = False
@@ -383,17 +389,20 @@ class MLMLoss(nn.Module):
 
         # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
         indices_replaced = (
-            torch.bernoulli(torch.full(input_ids.shape, 0.8)).bool() & masked_indices
+            torch.bernoulli(torch.full(input_ids.shape, 0.8, device=input_ids.device)).bool()
+            & masked_indices
         )
         input_ids[indices_replaced] = self.tokenizer.mask_token_id
 
         # 10% of the time, we replace masked input tokens with random word
         indices_random = (
-            torch.bernoulli(torch.full(input_ids.shape, 0.5)).bool()
+            torch.bernoulli(torch.full(input_ids.shape, 0.5, device=input_ids.device)).bool()
             & masked_indices
             & ~indices_replaced
         )
-        random_words = torch.randint(vocab_size, input_ids.shape, dtype=torch.long).to(device)
+        random_words = torch.randint(
+            vocab_size, input_ids.shape, dtype=torch.long, device=input_ids.device
+        )
         input_ids[indices_random] = random_words[indices_random]
         # The rest of the time (10% of the time) we keep the masked input tokens unchanged
 
