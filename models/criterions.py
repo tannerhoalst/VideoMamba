@@ -1,5 +1,4 @@
 import logging
-from functools import lru_cache
 from typing import cast
 
 import torch
@@ -7,7 +6,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from models.utils import allgather_wgrad
-from utils.distributed import get_rank, get_world_size
+from utils.distributed import get_rank, get_world_size, is_dist_avail_and_initialized
 from utils.easydict import EasyDict
 
 logger = logging.getLogger(__name__)
@@ -84,7 +83,10 @@ class VTC_VTM_Loss(nn.Module):
         Returns: loss_vtc (torch.Tensor): The video-text contrastive loss. Shape: [].
 
         """
-        if all_gather:
+        should_gather = (
+            all_gather and is_dist_avail_and_initialized() and get_world_size() > 1
+        )
+        if should_gather:
             gather_args = self.get_gather_args()
             vision_proj = cast(torch.Tensor, allgather_wgrad(vision_proj, gather_args))
             text_proj = cast(torch.Tensor, allgather_wgrad(text_proj, gather_args))
@@ -131,6 +133,10 @@ class VTC_VTM_Loss(nn.Module):
         Returns: TODO
 
         """
+        batch_size = vision_embeds.shape[0]
+        if batch_size < 2:
+            raise ValueError("vtm_loss requires batch size >= 2 to sample negatives.")
+
         with torch.no_grad():
             sim_v2t, sim_t2v = get_sim(vision_proj, text_proj, temp)
             vision_atts = torch.ones(
@@ -140,18 +146,38 @@ class VTC_VTM_Loss(nn.Module):
             weights_t2v = F.softmax(sim_t2v + 1e-4, dim=1)
 
             mask = self.get_mask(sim_v2t, idx=idx).bool()
+            valid_negatives = ~mask
+            if not torch.all(valid_negatives.any(dim=1)):
+                raise ValueError(
+                    "vtm_loss requires at least one negative candidate per sample."
+                )
             weights_v2t.masked_fill_(mask, 0)
             weights_t2v.masked_fill_(mask, 0)
-            weights_v2t = torch.nan_to_num_(weights_v2t, nan=1e-2, posinf=1e-2, neginf=1e-2)
-            weights_t2v = torch.nan_to_num_(weights_t2v, nan=1e-2, posinf=1e-2, neginf=1e-2)
+
+            # Renormalize after masking positives; fallback to uniform negatives if needed.
+            uniform_weights = valid_negatives.to(weights_v2t.dtype)
+            uniform_weights = uniform_weights / uniform_weights.sum(dim=1, keepdim=True)
+
+            sum_v2t = weights_v2t.sum(dim=1, keepdim=True)
+            sum_t2v = weights_t2v.sum(dim=1, keepdim=True)
+            weights_v2t = torch.where(
+                sum_v2t > 0,
+                weights_v2t / sum_v2t,
+                uniform_weights,
+            )
+            weights_t2v = torch.where(
+                sum_t2v > 0,
+                weights_t2v / sum_t2v,
+                uniform_weights,
+            )
 
         # select a negative image for each text
         if self.vtm_hard_neg:
-            vision_neg_indices = torch.multinomial(weights_t2v, 1).squeeze()
-            txt_neg_indices = torch.multinomial(weights_v2t, 1).squeeze()
+            vision_neg_indices = torch.multinomial(weights_t2v, 1).squeeze(1)
+            txt_neg_indices = torch.multinomial(weights_v2t, 1).squeeze(1)
         else:
-            vision_neg_indices = self.get_rand_indices(mask, 1).squeeze()
-            txt_neg_indices = self.get_rand_indices(mask, 1).squeeze()
+            vision_neg_indices = self.get_rand_indices(mask, 1).squeeze(1)
+            txt_neg_indices = self.get_rand_indices(mask, 1).squeeze(1)
 
         vision_embeds_neg = vision_embeds[vision_neg_indices]  # [B, T*L, c]
         text_embeds_neg = text_embeds[txt_neg_indices]  # [B, L, d]
@@ -191,11 +217,13 @@ class VTC_VTM_Loss(nn.Module):
             The sampled indices. Shape: [N,k].
             (N, k) indices
         """
-        mask = mask.float()
-        mask = mask - 10000 * mask
-        mask += torch.randn_like(mask)
-        _, indices = torch.sort(mask, dim=1, descending=True)
-        indices = indices[:, :k].contiguous()
+        valid = ~mask.bool()
+        if not torch.all(valid.any(dim=1)):
+            raise ValueError("Each sample must have at least one valid negative index.")
+        scores = torch.rand(mask.shape, device=mask.device)
+        scores = scores.masked_fill(~valid, -1.0)
+        _, indices = torch.topk(scores, k=k, dim=1)
+        indices = indices.contiguous()
         return indices
 
     @torch.no_grad()
@@ -216,7 +244,6 @@ class VTC_VTM_Loss(nn.Module):
             mask.fill_diagonal_(1)
         return mask  # `1` mark valid/matched location
 
-    @lru_cache(maxsize=16)
     def get_gather_args(self):
         """obtain the args for all_gather
         Returns: dict.

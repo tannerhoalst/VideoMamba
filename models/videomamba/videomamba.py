@@ -705,7 +705,58 @@ class PretrainVideoMamba(nn.Module):
             raise ValueError(
                 f"mask token length mismatch: expected {token_count}, got {mask.shape[1]}."
             )
+        if token_count > 0 and torch.any(mask[:, 0]):
+            raise ValueError("mask must keep CLS token visible (mask[:, 0] must be False).")
         return mask
+
+    def _masked_temporal_average(
+        self,
+        patch_tokens: Tensor,
+        visible_positions: Tensor,
+        temporal_tokens: int,
+    ) -> Tensor:
+        """Average visible patch tokens per temporal slice under arbitrary masking."""
+        if patch_tokens.ndim != 3:
+            raise ValueError("patch_tokens must have shape [B, N, C].")
+        if visible_positions.ndim != 2:
+            raise ValueError("visible_positions must have shape [B, N_total_visible].")
+        if patch_tokens.shape[0] != visible_positions.shape[0]:
+            raise ValueError("Batch size mismatch between patch_tokens and visible_positions.")
+        if visible_positions.shape[1] != patch_tokens.shape[1] + 1:
+            raise ValueError(
+                "visible_positions must include one CLS position in addition to patch tokens."
+            )
+        if visible_positions.numel() > 0 and not torch.all(visible_positions[:, 0] == 0):
+            raise ValueError("mask must keep CLS token visible for temporal pooling.")
+
+        tokens_per_frame = self.patch_embed.num_patches
+        patch_positions = visible_positions[:, 1:] - 1
+        frame_indices = torch.div(
+            patch_positions, tokens_per_frame, rounding_mode="floor"
+        ).to(dtype=torch.long)
+
+        B, _, C = patch_tokens.shape
+        temporal_sum = torch.zeros(
+            B, temporal_tokens, C, device=patch_tokens.device, dtype=patch_tokens.dtype
+        )
+        temporal_sum.scatter_add_(
+            1, frame_indices.unsqueeze(-1).expand(-1, -1, C), patch_tokens
+        )
+
+        temporal_counts = torch.zeros(
+            B, temporal_tokens, 1, device=patch_tokens.device, dtype=patch_tokens.dtype
+        )
+        ones = torch.ones(
+            B, patch_tokens.shape[1], 1, device=patch_tokens.device, dtype=patch_tokens.dtype
+        )
+        temporal_counts.scatter_add_(1, frame_indices.unsqueeze(-1), ones)
+
+        if torch.any(temporal_counts == 0):
+            raise ValueError(
+                "keep_temporal with masking requires at least one visible patch token "
+                "for each temporal slice."
+            )
+        return temporal_sum / temporal_counts
 
     def _visible_token_positions(
         self, mask: Optional[Tensor], batch_size: int, token_count: int, device: torch.device
@@ -1021,19 +1072,27 @@ class PretrainVideoMamba(nn.Module):
             else:
                 if keep_temporal:
                     B, _, C_CLIP = x_vis.shape
-                    if self.pool_type == "cls+avg":
-                        x_pool_vis = self.pool_norm(
-                            x_vis_cls + x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
-                        )
-                    elif self.pool_type == "cls_cat_avg":
+                    if mask is None:
                         temporal_avg = x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
+                    else:
+                        full_token_count = 1 + temporal_tokens * self.patch_embed.num_patches
+                        _, visible_positions = self._visible_token_positions(
+                            mask, B, full_token_count, x.device
+                        )
+                        assert visible_positions is not None
+                        temporal_avg = self._masked_temporal_average(
+                            x_vis,
+                            visible_positions,
+                            temporal_tokens,
+                        )
+                    if self.pool_type == "cls+avg":
+                        x_pool_vis = self.pool_norm(x_vis_cls + temporal_avg)
+                    elif self.pool_type == "cls_cat_avg":
                         x_pool_vis = self.pool_norm(
                             torch.cat([x_vis_cls, temporal_avg], dim=1)
                         )
                     elif self.pool_type == "avg":
-                        x_pool_vis = self.pool_norm(
-                            x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
-                        )
+                        x_pool_vis = self.pool_norm(temporal_avg)
                     else:
                         raise ValueError(f"Unsupported pool_type: {self.pool_type}")
                 else:

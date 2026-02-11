@@ -4,12 +4,30 @@ from typing import Any
 import pytest
 import torch
 
+from models.criterions import VTC_VTM_Loss
 from models.mask import RandomMaskingGenerator, TubeMaskingGenerator
 from models.videomamba import build_videomamba
 from models.videomamba.mamba_simple import Mamba
-from models.videomamba.videomamba import PretrainVideoMamba, create_block, load_state_dict
 import models.videomamba.videomamba as videomamba_module
+from models.videomamba.videomamba import PretrainVideoMamba, create_block, load_state_dict
 from utils.distributed import _parse_slurm_tasks_per_node
+
+
+class _DummyMultimodalEncoder(torch.nn.Module):
+    def forward(
+        self,
+        encoder_embeds,
+        attention_mask,
+        encoder_hidden_states,
+        encoder_attention_mask,
+        return_dict,
+        mode,
+    ):
+        _ = attention_mask, encoder_hidden_states, encoder_attention_mask, return_dict, mode
+        bsz, seqlen, dim = encoder_embeds.shape
+        return SimpleNamespace(
+            last_hidden_state=torch.randn(bsz, seqlen, dim, device=encoder_embeds.device)
+        )
 
 
 def _small_model(**overrides):
@@ -191,6 +209,37 @@ def test_parse_slurm_tasks_per_node():
     assert _parse_slurm_tasks_per_node("16(x2),8") == 40
 
 
+def test_vtc_loss_default_all_gather_path_is_safe_without_distributed():
+    loss_module = VTC_VTM_Loss(vtm_hard_neg=True)
+    vision_proj = torch.randn(3, 2, 8)
+    text_proj = torch.randn(3, 8)
+    idx = torch.arange(3)
+    default_loss = loss_module.vtc_loss(vision_proj, text_proj, idx, temp=0.07)
+    local_loss = loss_module.vtc_loss(
+        vision_proj, text_proj, idx, temp=0.07, all_gather=False
+    )
+    torch.testing.assert_close(default_loss, local_loss)
+
+
+def test_vtm_loss_rejects_batch_size_one():
+    loss_module = VTC_VTM_Loss(vtm_hard_neg=True)
+    encoder = _DummyMultimodalEncoder()
+    vtm_head = torch.nn.Linear(8, 2)
+
+    with pytest.raises(ValueError, match="batch size >= 2"):
+        loss_module.vtm_loss(
+            multimodal_encoder=encoder,
+            vtm_head=vtm_head,
+            temp=0.07,
+            vision_embeds=torch.randn(1, 2, 3, 8),
+            text_embeds=torch.randn(1, 3, 8),
+            vision_proj=torch.randn(1, 2, 8),
+            text_proj=torch.randn(1, 8),
+            text_atts=torch.ones(1, 3, dtype=torch.long),
+            idx=torch.arange(1),
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
 def test_clip_return_layer_zero_no_longer_crashes():
     model = _small_model(clip_return_layer=0).cuda().eval()
@@ -235,6 +284,16 @@ def test_masked_forward_rejects_legacy_mask_shape():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_masked_forward_rejects_masked_cls_token():
+    model = _small_model().cuda().eval()
+    x = torch.randn(1, 3, 4, 8, 8, device="cuda")
+    mask = torch.zeros(1, 1 + 4 * 2 * 2, dtype=torch.bool, device="cuda")
+    mask[:, 0] = True
+    with pytest.raises(ValueError, match="CLS token visible"):
+        model(x, mask=mask, use_image=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
 def test_keep_temporal_cls_cat_avg_concatenates_cls_and_temporal_avg():
     model_add = _small_model(pool_type="cls+avg").cuda().eval()
     model_cat = _small_model(pool_type="cls_cat_avg").cuda().eval()
@@ -248,6 +307,35 @@ def test_keep_temporal_cls_cat_avg_concatenates_cls_and_temporal_avg():
 
     assert pool_add.shape == (1, temporal_tokens, model_add.embed_dim)
     assert pool_cat.shape == (1, temporal_tokens + 1, model_cat.embed_dim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_keep_temporal_masked_forward_supports_nonuniform_visible_per_frame():
+    model = _small_model(pool_type="cls+avg").cuda().eval()
+    x = torch.randn(2, 3, 4, 8, 8, device="cuda")
+
+    mask = torch.ones(2, 1 + 4 * 2 * 2, dtype=torch.bool, device="cuda")
+    # Keep cls and patch tokens with per-frame visible counts [1, 2, 1, 3].
+    visible_positions = torch.tensor([0, 1, 5, 6, 9, 13, 14, 15], device="cuda")
+    mask[:, visible_positions] = False
+
+    with torch.no_grad():
+        _, x_pool, _ = model(x, mask=mask, use_image=False, keep_temporal=True)
+
+    assert x_pool.shape == (2, 4, model.embed_dim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_keep_temporal_masked_forward_requires_visible_tokens_in_each_frame():
+    model = _small_model(pool_type="cls+avg").cuda().eval()
+    x = torch.randn(1, 3, 4, 8, 8, device="cuda")
+    mask = torch.ones(1, 1 + 4 * 2 * 2, dtype=torch.bool, device="cuda")
+    # Keep cls and only frame-0 patch tokens.
+    visible_positions = torch.tensor([0, 1, 2], device="cuda")
+    mask[:, visible_positions] = False
+
+    with pytest.raises(ValueError, match="at least one visible patch token"):
+        model(x, mask=mask, use_image=False, keep_temporal=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
