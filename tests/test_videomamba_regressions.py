@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,7 +11,8 @@ from models.videomamba import build_videomamba
 from models.videomamba.mamba_simple import Mamba
 import models.videomamba.videomamba as videomamba_module
 from models.videomamba.videomamba import PretrainVideoMamba, create_block, load_state_dict
-from utils.config_utils import setup_deepspeed_zero_config
+from utils.config import Config
+from utils.config_utils import setup_deepspeed_config, setup_deepspeed_zero_config
 from utils.distributed import _parse_slurm_tasks_per_node
 
 
@@ -215,6 +217,46 @@ def test_setup_deepspeed_zero_config_invalid_stage_raises_value_error():
         setup_deepspeed_zero_config(4)
 
 
+def test_setup_deepspeed_config_uses_world_size_one_without_dist_init(tmp_path):
+    config = SimpleNamespace(
+        output_dir=str(tmp_path / "ds_cfg"),
+        batch_size=4,
+        optimizer=SimpleNamespace(
+            lr=1e-4,
+            weight_decay=0.01,
+            opt_betas=(0.9, 0.999),
+        ),
+        deepspeed=SimpleNamespace(stage=1, enable=True),
+        fp16=True,
+        bf16=True,
+    )
+    config.get = lambda key, default=None: getattr(config, key, default)
+
+    setup_deepspeed_config(config)
+
+    with open(config.deepspeed_config, "r") as f:
+        ds_config = json.load(f)
+    assert ds_config["train_batch_size"] == 4
+    assert ds_config["train_micro_batch_size_per_gpu"] == 4
+
+
+def test_config_from_file_python_module_cache_does_not_collide(tmp_path):
+    cfg_a_dir = tmp_path / "a"
+    cfg_b_dir = tmp_path / "b"
+    cfg_a_dir.mkdir()
+    cfg_b_dir.mkdir()
+    cfg_a = cfg_a_dir / "cfg.py"
+    cfg_b = cfg_b_dir / "cfg.py"
+    cfg_a.write_text("value = 1\n", encoding="utf-8")
+    cfg_b.write_text("value = 2\n", encoding="utf-8")
+
+    loaded_a = Config.from_file(str(cfg_a))
+    loaded_b = Config.from_file(str(cfg_b))
+
+    assert loaded_a.value == 1
+    assert loaded_b.value == 2
+
+
 def test_vtc_loss_default_all_gather_path_is_safe_without_distributed():
     loss_module = VTC_VTM_Loss(vtm_hard_neg=True)
     vision_proj = torch.randn(3, 2, 8)
@@ -329,6 +371,17 @@ def test_masked_forward_rejects_masked_cls_token():
     mask[:, 0] = True
     with pytest.raises(ValueError, match="CLS token visible"):
         model(x, mask=mask, use_image=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_masked_forward_rejects_all_patch_tokens_for_avg_pool():
+    model = _small_model(pool_type="cls+avg").cuda().eval()
+    x = torch.randn(1, 3, 4, 8, 8, device="cuda")
+    mask = torch.ones(1, 1 + 4 * 2 * 2, dtype=torch.bool, device="cuda")
+    mask[:, 0] = False
+
+    with pytest.raises(ValueError, match="at least one patch token visible"):
+        model(x, mask=mask, use_image=False, keep_temporal=False)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")

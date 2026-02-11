@@ -1082,6 +1082,11 @@ class PretrainVideoMamba(nn.Module):
 
         if self.add_pool_norm:
             x_vis_cls, x_vis = x_vis[:, :1], x_vis[:, 1:]
+            if self.pool_type != "cls" and x_vis.shape[1] == 0:
+                raise ValueError(
+                    "mask must keep at least one patch token visible when using "
+                    f"pool_type='{self.pool_type}'."
+                )
             if self.pool_type == "cls":  # only return cls token
                 x_pool_vis = self.pool_norm(x_vis_cls)
             else:

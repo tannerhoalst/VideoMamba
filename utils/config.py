@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
 import os.path as osp
 import re
 import sys
 from copy import deepcopy
-from importlib import import_module
 
 import yaml
 
@@ -117,8 +117,23 @@ class Config(object):
         if not osp.isfile(filepath):
             raise IOError(f"File does not exist: {filepath}")
         if filepath.endswith(".py"):
-            sys.path.insert(0, osp.dirname(filepath))
-            mod = import_module(osp.splitext(osp.basename(filepath))[0])
+            cfg_dir = osp.dirname(filepath)
+            module_name = (
+                f"_videomamba_config_"
+                f"{abs(hash(filepath))}_{abs(hash((filepath, id(cls))))}"
+            )
+            spec = importlib.util.spec_from_file_location(module_name, filepath)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot import config file: {filepath}")
+            mod = importlib.util.module_from_spec(spec)
+            sys.path.insert(0, cfg_dir)
+            sys.modules[module_name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            finally:
+                sys.modules.pop(module_name, None)
+                if sys.path and sys.path[0] == cfg_dir:
+                    sys.path.pop(0)
             cfg_dict = {
                 name: value
                 for name, value in mod.__dict__.items()

@@ -3,10 +3,8 @@ import logging
 import os
 from os.path import dirname, join
 
-import torch.distributed as dist
-
 from utils.config import Config
-from utils.distributed import init_distributed_mode, is_main_process
+from utils.distributed import get_world_size, init_distributed_mode, is_main_process
 from utils.logger import setup_logger
 
 logger = logging.getLogger(__name__)
@@ -106,7 +104,7 @@ def setup_deepspeed_config(config):
 
     with open(config.deepspeed_config, mode="w") as writer:
         ds_config = {
-            "train_batch_size": config.batch_size * dist.get_world_size(),
+            "train_batch_size": config.batch_size * get_world_size(),
             "train_micro_batch_size_per_gpu": config.batch_size,
             "steps_per_print": 100,
             "optimizer": {

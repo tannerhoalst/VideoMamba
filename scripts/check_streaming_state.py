@@ -5,7 +5,11 @@ from models.videomamba.mamba_simple import Mamba
 
 def main():
     torch.manual_seed(0)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "check_streaming_state.py requires CUDA because VideoMamba kernels are CUDA-only."
+        )
+    device = torch.device("cuda")
 
     model = Mamba(
         d_model=16,
