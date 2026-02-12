@@ -14,8 +14,6 @@ pip install -e .
 This repository provides a minimal VideoMamba backbone implementation for video applications.
 It focuses on the encoder, state handling, checkpoint loading, and chunked processing.
 
-CUDA requirement: this package uses `causal-conv1d` CUDA kernels and does not provide a CPU fallback.
-
 ## Quick Usage
 
 ```python
