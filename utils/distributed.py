@@ -124,8 +124,7 @@ def init_distributed_mode(args):
     if hasattr(args, "deepspeed") and args.deepspeed.enable:
         if deepspeed is None:
             raise ImportError(
-                "deepspeed is not installed. Install optional training dependencies with "
-                "`pip install -e .[training]`."
+                "deepspeed is not installed. Install it with `pip install deepspeed`."
             )
         deepspeed.init_distributed(
             dist_backend=args.dist_backend,

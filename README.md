@@ -1,24 +1,22 @@
-# VideoMamba Backbone
+# VideoMamba Backbone Utility
 
-## Setup and installation
+## Setup
 
 ```shell
 python3 -m venv .venv
 source .venv/bin/activate
 
 pip install -U pip setuptools wheel
-pip install -U torch  # install a stable CUDA wheel that matches your environment
+pip install -U torch  # install a CUDA wheel that matches your system
 pip install -e .
 ```
 
-This repository contains a minimal VideoMamba video encoder backbone for use in
-other projects. Training scripts, datasets, and alternative backbones have been
-removed to keep the package lightweight.
+This repository provides a minimal VideoMamba backbone implementation for video applications.
+It focuses on the encoder, state handling, checkpoint loading, and chunked processing.
 
-CUDA requirement: this minimal package uses `causal-conv1d` CUDA kernels and
-does not provide a CPU inference/training fallback.
+CUDA requirement: this package uses `causal-conv1d` CUDA kernels and does not provide a CPU fallback.
 
-## Usage
+## Quick Usage
 
 ```python
 from types import SimpleNamespace
@@ -43,10 +41,6 @@ config = SimpleNamespace(
         num_frames=8,
         use_checkpoint=False,
         checkpoint_num=0,
-        clip_decoder_embed_dim=192,
-        clip_output_dim=512,
-        clip_return_layer=1,
-        clip_student_return_interval=1,
         pretrained=None,
     )
 )
@@ -54,56 +48,50 @@ config = SimpleNamespace(
 model = build_videomamba(config)
 ```
 
-For more details on arguments and outputs, see `models/videomamba/videomamba.py`.
+## Output API
 
-Strict config/checkpoint contract:
+With default `add_pool_norm=True`:
+- `forward(...) -> (x_vis, x_pool)`
+- `forward(..., ssm_state=state) -> (x_vis, x_pool, next_state)`
+
+With `add_pool_norm=False`:
+- `forward(...) -> x_vis`
+- `forward(..., ssm_state=state) -> (x_vis, next_state)`
+
+For feature-only output:
+- `forward_features(...) -> x_vis`
+- `forward_features(..., ssm_state=state) -> (x_vis, next_state)`
+
+## Checkpoint Contract
+
 - `vision_encoder.channels` is required (no `in_chans` fallback).
 - Pretrained checkpoints must be plain `state_dict` files (no `{"model": ...}` / `{"module": ...}` wrapper).
 - If `pretrained` is set, `vision_encoder.ckpt_num_frame` must be provided.
 
-## Streaming training
+## Streaming / Chunked Inference
 
-Chunked training can carry differentiable Mamba state across windows. State is a
-tuple of `(conv_state, ssm_state)` per layer.
+Mamba state can be carried across chunks using `(conv_state, ssm_state)` per layer.
 
 ```python
-from models.videomamba.mamba_simple import Mamba
+state = model.init_state(batch_size=2, dtype=x.dtype, device=x.device)
+offset_tokens = chunk_start // model.patch_embed.tubelet_size
 
-model = Mamba(d_model=192, d_state=16, d_conv=4, expand=2)
-x = torch.randn(2, 12, 192)  # (B, L, D)
-
-out1, state = model(x[:, :6], return_state=True)
-out2, state = model(x[:, 6:], state=state, return_state=True)
-out = torch.cat([out1, out2], dim=1)
+# returns (x_vis, x_pool, next_state) with default add_pool_norm=True
+x_vis, x_pool, state = model(
+    x_chunk,
+    ssm_state=state,
+    temporal_pos_offset=offset_tokens,
+)
 ```
 
 State shapes (per layer):
 - `conv_state`: `(B, D_inner, d_conv)`
 - `ssm_state`: `(B, D_inner, d_state)`
 
-For VideoMamba, pass a per-layer list/tuple/dict of states and use
-`temporal_pos_offset` to align chunked temporal positions (post-tubelet).
+Note: when using streaming with `keep_temporal=True` on non-initial chunks (`temporal_pos_offset > 0`),
+`pool_type='avg'` is supported. CLS-based temporal pooling is chunk-boundary dependent.
 
-```python
-state = model.init_state(batch_size=2, dtype=x.dtype, device=x.device)
-offset_tokens = chunk_start // model.patch_embed.tubelet_size
-out = model(x_chunk, ssm_state=state, temporal_pos_offset=offset_tokens)
-```
+## Performance Notes
 
-## Training Utilities
-
-Optional training utilities (configs, logging, distributed helpers, and loss
-functions) are available under `utils/` and `models/criterions.py`. Install them
-with:
-
-```shell
-pip install -e .[training]
-```
-
-Determinism: use `utils.basic_utils.setup_seed(seed, deterministic=True)` to
-enable deterministic CUDA kernels (may reduce throughput).
-
-Performance: fused kernels can be disabled by setting
-`VIDEOMAMBA_DISABLE_FUSED=1` or by passing `ssm_cfg={"use_fast_path": False}` in
-the model config. Chunk size is a throughput vs memory tradeoff: larger chunks
-reduce kernel launch overhead but increase activation memory.
+- Disable fused kernels via `VIDEOMAMBA_DISABLE_FUSED=1` or `ssm_cfg={"use_fast_path": False}`.
+- Chunk size trades throughput for memory: larger chunks reduce launch overhead, increase activation memory.

@@ -5,7 +5,6 @@ import math
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union, cast
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
@@ -103,7 +102,7 @@ class Block(nn.Module):
         Args:
             hidden_states: the sequence to the encoder layer (required).
             residual: hidden_states = Mixer(LN(residual))
-            state: Optional tuple (conv_state, ssm_state) for streaming training.
+            state: Optional tuple (conv_state, ssm_state) for streaming chunked execution.
             return_state: Whether to return the updated (conv_state, ssm_state).
         """
         if state is not None and ssm_state is not None:
@@ -336,92 +335,6 @@ class PatchEmbed(nn.Module):
         return x
 
 
-class Linear_Decoder(nn.Module):
-    def __init__(
-        self,
-        output_dim: int = 768,
-        embed_dim: int = 768,
-        norm_layer: Callable[[int], nn.Module] = nn.LayerNorm,
-    ):
-        super().__init__()
-
-        self.head = nn.Linear(embed_dim, output_dim)
-        self.norm = norm_layer(output_dim)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def forward(self, x):
-        x = self.norm(self.head(x))
-        return x
-
-
-# sin-cos position encoding
-# https://github.com/jadore801120/attention-is-all-you-need-pytorch/blob/master/transformer/Models.py#L31
-def get_sinusoid_encoding_table(n_position, d_hid):
-    """Sinusoid position encoding table"""
-
-    # TODO: make it with torch instead of numpy
-    def get_position_angle_vec(position):
-        return [
-            position / np.power(10000, 2 * (hid_j // 2) / d_hid)
-            for hid_j in range(d_hid)
-        ]
-
-    sinusoid_table = np.array(
-        [get_position_angle_vec(pos_i) for pos_i in range(n_position)]
-    )
-    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
-    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
-
-    return torch.tensor(
-        sinusoid_table, dtype=torch.float, requires_grad=False
-    ).unsqueeze(0)
-
-
-def get_sinusoid_encoding_table_torch(
-    n_position: int,
-    d_hid: int,
-    offset: int = 0,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> Tensor:
-    if n_position <= 0:
-        raise ValueError("n_position must be positive.")
-    if d_hid <= 0:
-        raise ValueError("d_hid must be positive.")
-    if offset < 0:
-        raise ValueError("offset must be non-negative.")
-    angles = (
-        torch.arange(offset, offset + n_position, device=device, dtype=torch.float32)
-        .unsqueeze(1)
-        .div(
-            torch.pow(
-                10000.0,
-                (
-                    2
-                    * torch.floor(
-                        torch.arange(d_hid, device=device, dtype=torch.float32) / 2
-                    )
-                    / d_hid
-                ),
-            )
-        )
-    )
-    sinusoid_table = torch.empty_like(angles)
-    sinusoid_table[:, 0::2] = torch.sin(angles[:, 0::2])
-    sinusoid_table[:, 1::2] = torch.cos(angles[:, 1::2])
-    return sinusoid_table.unsqueeze(0).to(dtype=torch.float32 if dtype is None else dtype)
-
-
 class PretrainVideoMamba(nn.Module):
     def __init__(
         self,
@@ -447,11 +360,6 @@ class PretrainVideoMamba(nn.Module):
         # checkpoint
         use_checkpoint: bool = False,
         checkpoint_num: int = 0,
-        # clip,
-        clip_decoder_embed_dim: Optional[int] = None,
-        clip_output_dim: int = 512,
-        clip_return_layer: int = 1,
-        clip_student_return_interval: int = 1,
         add_pool_norm: bool = True,
     ):
         factory_kwargs: Dict[str, object] = {}  # follow MambaLMHeadModel
@@ -464,28 +372,12 @@ class PretrainVideoMamba(nn.Module):
             raise NotImplementedError(
                 "This minimal VideoMamba package only supports bimamba=True."
             )
-        if clip_return_layer < 0:
-            raise ValueError("clip_return_layer must be >= 0.")
-        if clip_student_return_interval <= 0:
-            raise ValueError("clip_student_return_interval must be > 0.")
         self.residual_in_fp32 = residual_in_fp32
         self.fused_add_norm = fused_add_norm
         self.use_checkpoint = use_checkpoint
         self.checkpoint_num = checkpoint_num
-        self.clip_decoder_embed_dim = (
-            embed_dim if clip_decoder_embed_dim is None else clip_decoder_embed_dim
-        )
         logger.info(f"Use checkpoint: {use_checkpoint}")
         logger.info(f"Checkpoint number: {checkpoint_num}")
-        self.return_index = []
-        for i in range(clip_return_layer):
-            layer_index = depth - int(i * clip_student_return_interval) - 1
-            if layer_index < 0:
-                raise ValueError(
-                    "clip_return_layer and clip_student_return_interval exceed model depth."
-                )
-            self.return_index.append(layer_index)
-        logger.info(f"Student return index: {self.return_index}")
         self.depth = depth
         self.pool_type = pool_type
         logger.info(f"Pool type: {pool_type}")
@@ -509,15 +401,6 @@ class PretrainVideoMamba(nn.Module):
         self.temporal_pos_embedding = nn.Parameter(
             torch.zeros(1, num_frames // kernel_size, embed_dim)
         )
-        self.clip_input_proj: nn.Module
-        if self.clip_decoder_embed_dim == embed_dim:
-            self.clip_input_proj = nn.Identity()
-        else:
-            self.clip_input_proj = nn.Linear(
-                embed_dim,
-                self.clip_decoder_embed_dim,
-                **cast(Dict[str, Any], factory_kwargs),
-            )
 
         dpr = [
             x.item() for x in torch.linspace(0, drop_path_rate, depth)
@@ -551,25 +434,6 @@ class PretrainVideoMamba(nn.Module):
             (nn.LayerNorm if not rms_norm else RMSNorm)(
                 embed_dim, eps=norm_epsilon, **cast(Dict[str, Any], factory_kwargs)
             ),
-        )
-
-        # CLIP decoder
-        self.clip_decoder = nn.ModuleList(
-            [
-                Linear_Decoder(
-                    output_dim=clip_output_dim,
-                    embed_dim=self.clip_decoder_embed_dim,
-                    norm_layer=nn.LayerNorm,
-                )
-                for _ in range(clip_return_layer)
-            ]
-        )
-
-        self.clip_pos_embed = get_sinusoid_encoding_table(
-            num_patches * num_frames // kernel_size + 1, self.clip_decoder_embed_dim
-        )
-        self.clip_img_pos_embed = get_sinusoid_encoding_table(
-            num_patches + 1, self.clip_decoder_embed_dim
         )
 
         self.add_pool_norm = add_pool_norm
@@ -794,48 +658,6 @@ class PretrainVideoMamba(nn.Module):
         visible_positions = torch.sort(token_positions, dim=1).values[:, :num_visible]
         return normalized_mask, visible_positions
 
-    def _get_clip_pos_embedding(
-        self,
-        batch_size: int,
-        temporal_tokens: int,
-        use_image: bool,
-        temporal_pos_offset: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> Tensor:
-        if use_image:
-            tokens_per_frame = self.patch_embed.num_patches
-            expected_tokens = 1 + temporal_tokens * tokens_per_frame
-            if temporal_tokens == 1 and temporal_pos_offset == 0:
-                pos_embed = self.clip_img_pos_embed.to(device=device, dtype=dtype)
-                if expected_tokens > pos_embed.shape[1]:
-                    pos_embed = get_sinusoid_encoding_table_torch(
-                        expected_tokens,
-                        self.clip_decoder_embed_dim,
-                        device=device,
-                        dtype=dtype,
-                    )
-                else:
-                    pos_embed = pos_embed[:, :expected_tokens]
-                return pos_embed.repeat(batch_size, 1, 1)
-
-        if temporal_pos_offset < 0:
-            raise ValueError("temporal_pos_offset must be non-negative.")
-        tokens_per_frame = self.patch_embed.num_patches
-        start_token = 1 + temporal_pos_offset * tokens_per_frame
-        end_token = start_token + temporal_tokens * tokens_per_frame
-        pos_embed = self.clip_pos_embed.to(device=device, dtype=dtype)
-        if end_token > pos_embed.shape[1]:
-            pos_embed = get_sinusoid_encoding_table_torch(
-                end_token,
-                self.clip_decoder_embed_dim,
-                device=device,
-                dtype=dtype,
-            )
-        cls_token = pos_embed[:, :1]
-        spatial_tokens = pos_embed[:, start_token:end_token]
-        return torch.cat([cls_token, spatial_tokens], dim=1).repeat(batch_size, 1, 1)
-
     def forward_features(
         self,
         x: Tensor,
@@ -844,8 +666,8 @@ class PretrainVideoMamba(nn.Module):
         ssm_state: Optional[StateCollection] = None,
         temporal_pos_offset: int = 0,
     ) -> Union[
-        Tuple[Tensor, Optional[Tensor]],
-        Tuple[Tensor, Optional[Tensor], StateCollection],
+        Tensor,
+        Tuple[Tensor, StateCollection],
     ]:
         """Forward features with temporal position slicing.
 
@@ -893,7 +715,6 @@ class PretrainVideoMamba(nn.Module):
             x_vis = x.gather(1, visible_positions.unsqueeze(-1).expand(-1, -1, C))
         else:
             x_vis = x
-        x_clip_vis_list: List[Tensor] = []
 
         # mamba impl
         residual = None
@@ -952,11 +773,6 @@ class PretrainVideoMamba(nn.Module):
                     new_states[idx] = layer_state
                 else:
                     new_states[idx] = layer_state
-            if (idx - 1) in self.return_index:
-                assert residual is not None
-                x_clip_vis_list.append(
-                    self.norm(residual.to(dtype=self.norm.weight.dtype))
-                )  # share norm for mask
 
         if not self.fused_add_norm:
             if residual is None:
@@ -982,14 +798,7 @@ class PretrainVideoMamba(nn.Module):
                 ),
             )
 
-        if (self.depth - 1) in self.return_index:
-            if residual is None:
-                x_clip_vis_list.append(hidden_states)
-            else:
-                x_clip_vis_list.append(self.norm(residual.to(dtype=self.norm.weight.dtype)))
-
         x_vis = hidden_states
-        x_clip_vis = torch.stack(x_clip_vis_list) if x_clip_vis_list else None
 
         if new_states is not None and return_tuple_state:
             maybe_states = cast(List[Optional[LayerState]], new_states)
@@ -998,9 +807,9 @@ class PretrainVideoMamba(nn.Module):
                 if state_item is None:
                     raise ValueError("Expected full state for all layers.")
                 finalized_states.append(state_item)
-            return x_vis, x_clip_vis, tuple(finalized_states)
+            return x_vis, tuple(finalized_states)
         if ssm_state is None:
-            return x_vis, x_clip_vis
+            return x_vis
         if new_states is not None:
             if isinstance(new_states, list):
                 finalized_states: List[LayerState] = []
@@ -1008,9 +817,9 @@ class PretrainVideoMamba(nn.Module):
                     if state_item is None:
                         raise ValueError("Expected full state for all layers.")
                     finalized_states.append(state_item)
-                return x_vis, x_clip_vis, finalized_states
-            return x_vis, x_clip_vis, new_states
-        return x_vis, x_clip_vis, ssm_state
+                return x_vis, finalized_states
+            return x_vis, new_states
+        return x_vis, ssm_state
 
     def forward(
         self,
@@ -1021,10 +830,10 @@ class PretrainVideoMamba(nn.Module):
         ssm_state: Optional[StateCollection] = None,
         temporal_pos_offset: int = 0,
     ) -> Union[
-        Tuple[Tensor, Tensor, Optional[Tensor]],
-        Tuple[Tensor, Tensor, Optional[Tensor], StateCollection],
-        Tuple[Tensor, Optional[Tensor]],
-        Tuple[Tensor, Optional[Tensor], StateCollection],
+        Tuple[Tensor, Tensor],
+        Tuple[Tensor, Tensor, StateCollection],
+        Tensor,
+        Tuple[Tensor, StateCollection],
     ]:
         """Forward with optional temporal position offset.
 
@@ -1043,42 +852,11 @@ class PretrainVideoMamba(nn.Module):
             temporal_pos_offset=temporal_pos_offset,
         )  # [B, N_vis, C_e]
         if ssm_state is None:
-            x_vis, x_clip_vis = cast(Tuple[Tensor, Optional[Tensor]], features)
+            x_vis = cast(Tensor, features)
         else:
-            x_vis, x_clip_vis, ssm_state = cast(
-                Tuple[Tensor, Optional[Tensor], StateCollection], features
+            x_vis, ssm_state = cast(
+                Tuple[Tensor, StateCollection], features
             )
-
-        # align CLIP:
-        if mask is not None and x_clip_vis is not None and x_clip_vis.shape[0] > 0:
-            K, B, _, _ = x_clip_vis.shape
-            full_token_count = 1 + temporal_tokens * self.patch_embed.num_patches
-            mask, visible_positions = self._visible_token_positions(
-                mask, B, full_token_count, x.device
-            )
-            assert mask is not None
-            assert visible_positions is not None
-            x_clip_vis = cast(Tensor, self.clip_input_proj(x_clip_vis))
-            C_CLIP = x_clip_vis.shape[-1]
-            expand_clip_pos_embed = self._get_clip_pos_embedding(
-                batch_size=B,
-                temporal_tokens=temporal_tokens,
-                use_image=use_image,
-                temporal_pos_offset=temporal_pos_offset,
-                dtype=x_clip_vis.dtype,
-                device=x.device,
-            )
-            clip_pos_emd_vis = expand_clip_pos_embed.gather(
-                1, visible_positions.unsqueeze(-1).expand(-1, -1, C_CLIP)
-            ).unsqueeze(0).repeat(K, 1, 1, 1)
-            x_clip_full = x_clip_vis + clip_pos_emd_vis  # [K, B, N, C_d_clip]
-
-            x_clip = []
-            for idx, clip_decoder in enumerate(self.clip_decoder):
-                x_clip.append(clip_decoder(x_clip_full[idx]))
-            x_clip = torch.stack(x_clip)  # align and normalize
-        else:
-            x_clip = None
 
         if self.add_pool_norm:
             x_vis_cls, x_vis = x_vis[:, :1], x_vis[:, 1:]
@@ -1087,13 +865,23 @@ class PretrainVideoMamba(nn.Module):
                     "mask must keep at least one patch token visible when using "
                     f"pool_type='{self.pool_type}'."
                 )
+            if (
+                keep_temporal
+                and ssm_state is not None
+                and temporal_pos_offset > 0
+                and self.pool_type in {"cls+avg", "cls_cat_avg"}
+            ):
+                raise ValueError(
+                    "keep_temporal with streaming state only supports pool_type='avg'; "
+                    "CLS-based temporal pooling is chunk-boundary dependent."
+                )
             if self.pool_type == "cls":  # only return cls token
                 x_pool_vis = self.pool_norm(x_vis_cls)
             else:
                 if keep_temporal:
-                    B, _, C_CLIP = x_vis.shape
+                    B, _, C_hidden = x_vis.shape
                     if mask is None:
-                        temporal_avg = x_vis.view(B, temporal_tokens, -1, C_CLIP).mean(2)
+                        temporal_avg = x_vis.view(B, temporal_tokens, -1, C_hidden).mean(2)
                     else:
                         full_token_count = 1 + temporal_tokens * self.patch_embed.num_patches
                         _, visible_positions = self._visible_token_positions(
@@ -1130,12 +918,12 @@ class PretrainVideoMamba(nn.Module):
                         raise ValueError(f"Unsupported pool_type: {self.pool_type}")
 
             if ssm_state is None:
-                return x_vis, x_pool_vis, x_clip
-            return x_vis, x_pool_vis, x_clip, ssm_state
+                return x_vis, x_pool_vis
+            return x_vis, x_pool_vis, ssm_state
         else:
             if ssm_state is None:
-                return x_vis, x_clip
-            return x_vis, x_clip, ssm_state
+                return x_vis
+            return x_vis, ssm_state
 
 
 def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
@@ -1156,36 +944,72 @@ def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
 
     pos_embed_checkpoint = checkpoint_model["pos_embed"]
     embedding_size = pos_embed_checkpoint.shape[-1]  # channel dim
-    num_patches = model.patch_embed.num_patches  #
+    num_patches = model.patch_embed.num_patches
     num_extra_tokens = model.pos_embed.shape[-2] - num_patches  # 0/1
-    orig_size = int((pos_embed_checkpoint.shape[-2] - num_extra_tokens) ** 0.5)
-    # height (== width) for the new position embedding
-    new_size = int(num_patches**0.5)
+    orig_token_count = pos_embed_checkpoint.shape[-2] - num_extra_tokens
+    new_grid_h = model.patch_embed.img_size[0] // model.patch_embed.patch_size[0]
+    new_grid_w = model.patch_embed.img_size[1] // model.patch_embed.patch_size[1]
+    if new_grid_h * new_grid_w != num_patches:
+        raise ValueError(
+            "Model patch grid size mismatch: "
+            f"{new_grid_h}x{new_grid_w} != num_patches({num_patches})."
+        )
 
-    if orig_size != new_size:
+    def _infer_spatial_grid(
+        token_count: int, reference_grid: Tuple[int, int]
+    ) -> Tuple[int, int]:
+        if token_count <= 0:
+            raise ValueError("Position embedding must contain at least one spatial token.")
+        ref_h, ref_w = reference_grid
+        ref_ratio = float(ref_h) / float(ref_w)
+        best_hw: Optional[Tuple[int, int]] = None
+        best_score: Optional[Tuple[float, int]] = None
+        for h in range(1, int(math.sqrt(token_count)) + 1):
+            if token_count % h != 0:
+                continue
+            w = token_count // h
+            for hh, ww in ((h, w), (w, h)):
+                score = (
+                    abs((float(hh) / float(ww)) - ref_ratio),
+                    abs(hh - ref_h) + abs(ww - ref_w),
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_hw = (hh, ww)
+        if best_hw is None:
+            raise ValueError(f"Unable to infer spatial grid from token count {token_count}.")
+        return best_hw
+
+    orig_grid_h, orig_grid_w = _infer_spatial_grid(
+        orig_token_count, (new_grid_h, new_grid_w)
+    )
+
+    if (orig_grid_h, orig_grid_w) != (new_grid_h, new_grid_w):
         logger.info(
             "Position interpolate from %dx%d to %dx%d"
-            % (orig_size, orig_size, new_size, new_size)
+            % (orig_grid_h, orig_grid_w, new_grid_h, new_grid_w)
         )
         extra_tokens = pos_embed_checkpoint[:, :num_extra_tokens]
         # only the position tokens are interpolated
         pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
         # B, L, C -> B, H, W, C -> B, C, H, W
         pos_tokens = pos_tokens.reshape(
-            -1, orig_size, orig_size, embedding_size
+            -1, orig_grid_h, orig_grid_w, embedding_size
         ).permute(0, 3, 1, 2)
         pos_tokens = torch.nn.functional.interpolate(
-            pos_tokens, size=(new_size, new_size), mode="bicubic", align_corners=False
+            pos_tokens,
+            size=(new_grid_h, new_grid_w),
+            mode="bicubic",
+            align_corners=False,
         )
         # B, C, H, W -> B, H, W, C ->  B, H, W, C
         pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(
-            -1, new_size, new_size, embedding_size
+            -1, new_grid_h, new_grid_w, embedding_size
         )
         pos_tokens = pos_tokens.flatten(1, 2)  # B, L, C
         new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
         checkpoint_model["pos_embed"] = new_pos_embed
 
-    # we use 8 frames for pretraining
     temporal_pos_embed = checkpoint_model["temporal_pos_embedding"]
     if ckpt_num_frame is None or ckpt_num_frame <= 0:
         raise ValueError(
@@ -1226,9 +1050,6 @@ def build_videomamba(config, add_pool_norm=True):
     num_frames = vision_cfg.num_frames
     use_checkpoint = vision_cfg.use_checkpoint
     checkpoint_num = vision_cfg.checkpoint_num
-    clip_output_dim = vision_cfg.clip_output_dim
-    clip_return_layer = vision_cfg.clip_return_layer
-    clip_student_return_interval = vision_cfg.clip_student_return_interval
     model = PretrainVideoMamba(
         img_size=img_size,
         patch_size=patch_size,
@@ -1247,10 +1068,6 @@ def build_videomamba(config, add_pool_norm=True):
         num_frames=num_frames,
         use_checkpoint=use_checkpoint,
         checkpoint_num=checkpoint_num,
-        clip_decoder_embed_dim=vision_cfg.clip_decoder_embed_dim,
-        clip_output_dim=clip_output_dim,
-        clip_return_layer=clip_return_layer,
-        clip_student_return_interval=clip_student_return_interval,
         add_pool_norm=add_pool_norm,
     )
     object.__setattr__(model, "default_cfg", _cfg())
@@ -1268,22 +1085,16 @@ def build_videomamba(config, add_pool_norm=True):
 
 
 if __name__ == "__main__":
+    from utils.easydict import EasyDict
 
-    import numpy as np
-
-    seed = 4217
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(4217)
     num_frames = 8
-
     config = {
         "vision_encoder": {
             "img_size": 224,
             "patch_size": 16,
-            "depth": 32,
-            "embed_dim": 576,
+            "depth": 24,
+            "embed_dim": 192,
             "channels": 3,
             "drop_path_rate": 0.0,
             "ssm_cfg": None,
@@ -1292,39 +1103,16 @@ if __name__ == "__main__":
             "rms_norm": True,
             "residual_in_fp32": True,
             "bimamba": True,
-            "pool_type": "cls",
+            "pool_type": "cls+avg",
             "kernel_size": 1,
-            "num_frames": 8,
+            "num_frames": num_frames,
             "use_checkpoint": False,
             "checkpoint_num": 0,
-            "clip_decoder_embed_dim": 576,
-            "clip_output_dim": 512,
-            "clip_return_layer": 1,
-            "clip_student_return_interval": 1,
-            "pretrained": "your_model_path/videomamba_m16_k400_mask_pt_f8_res224.pth",
+            "pretrained": None,
         }
     }
-    from utils.easydict import EasyDict
-
-    channels = config["vision_encoder"].get("channels", 3)
-    model = build_videomamba(EasyDict(config)).cuda()
-
-    # flops = FlopCountAnalysis(model, torch.rand(1, channels, num_frames, 224, 224))
-    # s = time.time()
-    # logger.info(flop_count_table(flops, max_depth=1))
-    # logger.info(time.time()-s)
-    mask_token = num_frames * int(14 * 14 * 0.8)
-    mask = (
-        torch.cat(
-            [
-                torch.zeros(1, num_frames * 14 * 14 + 1 - mask_token),
-                torch.ones(1, mask_token),
-            ],
-            dim=-1,
-        )
-        .to(torch.bool)
-        .cuda()
-    )
-    logger.info(
-        model(torch.rand(1, channels, num_frames, 224, 224).cuda(), mask)[1].shape
-    )
+    model = build_videomamba(EasyDict(config)).cuda().eval()
+    x = torch.rand(2, 3, num_frames, 224, 224, device="cuda")
+    with torch.no_grad():
+        x_vis, x_pool = model(x, mask=None, use_image=False)
+    logger.info((x_vis.shape, x_pool.shape))
