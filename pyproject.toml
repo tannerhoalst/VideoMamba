@@ -31,7 +31,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 namespaces = true
-include = ["models*", "utils*"]
+include = ["models*", "utils*", "video_mamba*"]
 
 [tool.isort]
 profile = "black"
@@ -43,7 +43,7 @@ target-version = "py312"
 extend-exclude = [".venv", "video_mamba.egg-info"]
 
 [tool.pyright]
-include = ["models", "utils", "scripts"]
+include = ["models", "utils", "scripts", "video_mamba"]
 exclude = [".venv", "video_mamba.egg-info", "**/__pycache__"]
 typeCheckingMode = "basic"
 venvPath = "."

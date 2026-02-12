@@ -1,5 +1,4 @@
-from .videomamba import build_videomamba
-from .streaming import (
+from models.videomamba.streaming import (
     STREAMING_CONTRACT_VERSION,
     ForwardReturnSemantics,
     LayerState,
@@ -19,7 +18,6 @@ __all__ = [
     "StateShape",
     "StreamingState",
     "allocate_state",
-    "build_videomamba",
     "expected_state_shapes",
     "forward_return_semantics",
     "model_forward_return_semantics",

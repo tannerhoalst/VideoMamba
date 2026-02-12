@@ -16,6 +16,12 @@ from timm.models.vision_transformer import _cfg, _load_weights
 from torch import Tensor
 
 from .mamba_simple import InferenceParamsLike, Mamba
+from .streaming import (
+    STREAMING_CONTRACT_VERSION,
+    ForwardReturnSemantics,
+    StateShape,
+    forward_return_semantics as get_forward_return_semantics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +367,8 @@ class PatchEmbed(nn.Module):
 
 
 class PretrainVideoMamba(nn.Module):
+    streaming_contract_version: str = STREAMING_CONTRACT_VERSION
+
     def __init__(
         self,
         img_size: int = 224,
@@ -513,9 +521,13 @@ class PretrainVideoMamba(nn.Module):
             states_list.append(layer_state)
         return states_list
 
-    def init_state(
+    def allocate_state(
         self, batch_size: int, dtype=None, device=None, as_dict: bool = False
     ) -> Union[List[Tuple[Tensor, Tensor]], Dict[int, Tuple[Tensor, Tensor]]]:
+        """Allocate per-layer streaming state for chunked execution.
+
+        Contract version: ``self.streaming_contract_version``.
+        """
         if as_dict:
             states_dict: Dict[int, Tuple[Tensor, Tensor]] = {}
             for idx, layer_module in enumerate(self.layers):
@@ -533,6 +545,35 @@ class PretrainVideoMamba(nn.Module):
                 mixer.allocate_state(batch_size, dtype=dtype, device=device)
             )
         return states_list
+
+    def init_state(
+        self, batch_size: int, dtype=None, device=None, as_dict: bool = False
+    ) -> Union[List[Tuple[Tensor, Tensor]], Dict[int, Tuple[Tensor, Tensor]]]:
+        """Backward-compatible alias for ``allocate_state``."""
+        return self.allocate_state(
+            batch_size=batch_size, dtype=dtype, device=device, as_dict=as_dict
+        )
+
+    def expected_state_shapes(self, batch_size: int) -> Dict[int, StateShape]:
+        """Expected per-layer streaming state tensor shapes for ``batch_size``."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer.")
+        shapes: Dict[int, StateShape] = {}
+        for idx, layer_module in enumerate(self.layers):
+            layer = cast(Block, layer_module)
+            mixer = layer.mixer
+            d_inner = int(getattr(mixer, "d_inner"))
+            d_conv = int(getattr(mixer, "d_conv"))
+            d_state = int(getattr(mixer, "d_state"))
+            shapes[idx] = StateShape(
+                conv_state=(batch_size, d_inner, d_conv),
+                ssm_state=(batch_size, d_inner, d_state),
+            )
+        return shapes
+
+    def forward_return_semantics(self) -> ForwardReturnSemantics:
+        """Frozen return contract for ``forward(...)`` under current ``add_pool_norm``."""
+        return get_forward_return_semantics(self.add_pool_norm)
 
     @torch.jit.ignore()
     def no_weight_decay(self):

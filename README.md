@@ -18,7 +18,7 @@ It focuses on the encoder, state handling, checkpoint loading, and chunked proce
 
 ```python
 from types import SimpleNamespace
-from models.videomamba import build_videomamba
+from video_mamba import build_videomamba
 
 config = SimpleNamespace(
     vision_encoder=SimpleNamespace(
@@ -45,6 +45,25 @@ config = SimpleNamespace(
 
 model = build_videomamba(config)
 ```
+
+Legacy imports continue to work:
+
+```python
+from models.videomamba import build_videomamba
+```
+
+## Stable Public Imports
+
+- Stable alias: `video_mamba`
+- Legacy path (kept for compatibility): `models.videomamba`
+
+The following are part of the stable top-level API:
+- `video_mamba.build_videomamba`
+- `video_mamba.PretrainVideoMamba`
+- `video_mamba.allocate_state`
+- `video_mamba.expected_state_shapes`
+- `video_mamba.validate_state`
+- `video_mamba.STREAMING_CONTRACT_VERSION`
 
 ## Output API
 
@@ -75,7 +94,9 @@ Streaming note:
 Mamba state can be carried across chunks using `(conv_state, ssm_state)` per layer.
 
 ```python
-state = model.init_state(batch_size=2, dtype=x.dtype, device=x.device)
+from video_mamba import STREAMING_CONTRACT_VERSION, allocate_state
+
+state = allocate_state(model, batch_size=2, dtype=x.dtype, device=x.device)
 offset_tokens = chunk_start // model.patch_embed.tubelet_size
 
 # returns (x_vis, x_pool, next_state) with default add_pool_norm=True
@@ -86,14 +107,83 @@ x_vis, x_pool, state = model(
 )
 ```
 
+Contract API version:
+- `video_mamba.STREAMING_CONTRACT_VERSION` (current: `1.0.0`)
+- `model.streaming_contract_version`
+
 State shapes (per layer):
 - `conv_state`: `(B, D_inner, d_conv)`
 - `ssm_state`: `(B, D_inner, d_state)`
 
+Forward return semantics contract:
+- `add_pool_norm=True`:
+  - no state input: `(x_vis, x_pool)`
+  - with state input: `(x_vis, x_pool, next_state)`
+- `add_pool_norm=False`:
+  - no state input: `x_vis`
+  - with state input: `(x_vis, next_state)`
+
 Note: when using streaming with `keep_temporal=True` on non-initial chunks (`temporal_pos_offset > 0`),
 `pool_type='avg'` is supported. CLS-based pooling requires a CLS token and is not available for continuation chunks.
+
+## Determinism Knobs (Training/Inference)
+
+Use `video_mamba.configure_determinism(...)` (or CLI helpers) in your training and inference entrypoints:
+
+```python
+from video_mamba import configure_determinism
+
+configure_determinism(
+    seed=7,
+    deterministic=True,
+    warn_only=True,
+    cudnn_benchmark=False,
+    allow_tf32=False,
+)
+```
+
+The streaming check script exposes these flags directly:
+
+```shell
+python scripts/check_streaming_state.py \
+  --seed 7 \
+  --deterministic \
+  --deterministic-warn-only \
+  --cudnn-benchmark off \
+  --allow-tf32 off
+```
+
+## CI Compatibility Matrix
+
+GitHub Actions workflow: `.github/workflows/torch-cuda-matrix.yml`
+
+- `torch-2.4.1-cu121`
+- `torch-2.5.1-cu124`
+- `torch-dev-nightly-cu128` (or override with `TORCH_DEV_INSTALL_CMD`)
+
+Each lane runs a minimal CUDA streaming forward contract test.
 
 ## Performance Notes
 
 - Disable fused kernels via `VIDEOMAMBA_DISABLE_FUSED=1` or `ssm_cfg={"use_fast_path": False}`.
 - Chunk size trades throughput for memory: larger chunks reduce launch overhead, increase activation memory.
+
+### 5090-class GPU Presets
+
+Preset A (max throughput):
+- `chunk_size` (temporal tokens): `64`
+- state mode: full streaming state (`allocate_state` contract, carry `(conv_state, ssm_state)`)
+- `fused_add_norm=True`, `rms_norm=True`, `ssm_cfg={"use_fast_path": True}`
+- determinism: `False` (fastest)
+
+Preset B (balanced):
+- `chunk_size` (temporal tokens): `32`
+- state mode: full streaming state
+- `fused_add_norm=True`, `rms_norm=True`, `ssm_cfg={"use_fast_path": True}`
+- determinism: `True` for reproducible runs
+
+Preset C (lowest latency / tight memory):
+- `chunk_size` (temporal tokens): `8-16`
+- state mode: full streaming state
+- `fused_add_norm=False` only if debugging/compatibility requires it (otherwise keep fused on)
+- determinism: choose per workload; expect lower throughput when enabled

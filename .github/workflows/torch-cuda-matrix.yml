@@ -1,0 +1,70 @@
+name: Torch CUDA Matrix
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  streaming-contract:
+    name: ${{ matrix.name }}
+    runs-on: [self-hosted, linux, x64, gpu]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: torch-2.4.1-cu121
+            python-version: "3.10"
+            torch-install-cmd: >-
+              pip install --upgrade --pre "torch==2.4.1" --index-url https://download.pytorch.org/whl/cu121
+          - name: torch-2.5.1-cu124
+            python-version: "3.10"
+            torch-install-cmd: >-
+              pip install --upgrade --pre "torch==2.5.1" --index-url https://download.pytorch.org/whl/cu124
+          - name: torch-dev-nightly-cu128
+            python-version: "3.10"
+            torch-install-cmd: >-
+              pip install --upgrade --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      TORCH_DEV_INSTALL_CMD: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Torch
+        shell: bash
+        run: |
+          if [[ "${{ matrix.name }}" == "torch-dev-nightly-cu128" && -n "${TORCH_DEV_INSTALL_CMD}" ]]; then
+            echo "Using TORCH_DEV_INSTALL_CMD override"
+            eval "${TORCH_DEV_INSTALL_CMD}"
+          else
+            eval "${{ matrix.torch-install-cmd }}"
+          fi
+
+      - name: Install Project + test deps
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e .[dev]
+
+      - name: Smoke check deterministic streaming script
+        run: |
+          python scripts/check_streaming_state.py \
+            --seed 7 \
+            --deterministic \
+            --deterministic-warn-only \
+            --cudnn-benchmark off \
+            --allow-tf32 off
+
+      - name: Run minimal streaming contract test
+        run: |
+          pytest -q tests/test_public_api_contract.py -k minimal_cuda_streaming_forward_contract
