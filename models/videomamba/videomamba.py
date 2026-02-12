@@ -8,7 +8,6 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union, 
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
-from einops import rearrange
 from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 from timm.layers.drop import DropPath
 from timm.layers.helpers import to_2tuple
@@ -22,6 +21,32 @@ logger = logging.getLogger(__name__)
 
 LayerState = Union[Tensor, Tuple[Tensor, Tensor]]
 StateCollection = Union[List[LayerState], Tuple[LayerState, ...], Dict[int, LayerState]]
+
+
+def _infer_spatial_grid(
+    token_count: int, reference_grid: Tuple[int, int]
+) -> Tuple[int, int]:
+    if token_count <= 0:
+        raise ValueError("Position embedding must contain at least one spatial token.")
+    ref_h, ref_w = reference_grid
+    ref_ratio = float(ref_h) / float(ref_w)
+    best_hw: Optional[Tuple[int, int]] = None
+    best_score: Optional[Tuple[float, int]] = None
+    for h in range(1, int(math.sqrt(token_count)) + 1):
+        if token_count % h != 0:
+            continue
+        w = token_count // h
+        for hh, ww in ((h, w), (w, h)):
+            score = (
+                abs((float(hh) / float(ww)) - ref_ratio),
+                abs(hh - ref_h) + abs(ww - ref_w),
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_hw = (hh, ww)
+    if best_hw is None:
+        raise ValueError(f"Unable to infer spatial grid from token count {token_count}.")
+    return best_hw
 
 
 class NormLayerProtocol(Protocol):
@@ -511,7 +536,7 @@ class PretrainVideoMamba(nn.Module):
 
     @torch.jit.ignore()
     def no_weight_decay(self):
-        return {"pos_embed", "cls_token"}
+        return {"pos_embed", "cls_token", "temporal_pos_embedding"}
 
     def get_num_layers(self):
         return len(self.layers)
@@ -541,6 +566,49 @@ class PretrainVideoMamba(nn.Module):
             )
         return frame_count // tubelet
 
+    def _spatial_token_grid(self, height: int, width: int) -> Tuple[int, int]:
+        patch_h, patch_w = self.patch_embed.patch_size
+        if height < patch_h or width < patch_w:
+            raise ValueError(
+                "Input spatial size must be at least one patch: "
+                f"got ({height}, {width}) with patch size ({patch_h}, {patch_w})."
+            )
+        return height // patch_h, width // patch_w
+
+    def _get_spatial_pos_embedding(self, grid_h: int, grid_w: int, dtype=None, device=None):
+        if device is None:
+            device = self.pos_embed.device
+        if dtype is None:
+            dtype = self.pos_embed.dtype
+
+        patch_pos = self.pos_embed[:, 1:]
+        base_h = self.patch_embed.img_size[0] // self.patch_embed.patch_size[0]
+        base_w = self.patch_embed.img_size[1] // self.patch_embed.patch_size[1]
+        if base_h * base_w != patch_pos.shape[1]:
+            base_h, base_w = _infer_spatial_grid(patch_pos.shape[1], (base_h, base_w))
+
+        if (grid_h, grid_w) == (base_h, base_w):
+            return patch_pos.to(device=device, dtype=dtype)
+
+        pos = patch_pos.reshape(1, base_h, base_w, self.embed_dim).permute(0, 3, 1, 2)
+        pos = torch.nn.functional.interpolate(
+            pos.float(),
+            size=(grid_h, grid_w),
+            mode="bicubic",
+            align_corners=False,
+        )
+        pos = pos.permute(0, 2, 3, 1).reshape(1, grid_h * grid_w, self.embed_dim)
+        return pos.to(device=device, dtype=dtype)
+
+    def _has_cls_token_for_forward(
+        self, ssm_state: Optional[StateCollection], temporal_pos_offset: int
+    ) -> bool:
+        if ssm_state is None or temporal_pos_offset <= 0:
+            return True
+        layer_state = self._get_layer_state(ssm_state, 0)
+        is_full_state = isinstance(layer_state, (list, tuple)) and len(layer_state) == 2
+        return not is_full_state
+
     def _get_temporal_pos_embedding(
         self, seqlen: int, offset: int = 0, dtype=None, device=None
     ) -> Tensor:
@@ -564,7 +632,12 @@ class PretrainVideoMamba(nn.Module):
         return pos[:, offset:end]
 
     def _normalize_mask(
-        self, mask: Optional[Tensor], batch_size: int, token_count: int, device: torch.device
+        self,
+        mask: Optional[Tensor],
+        batch_size: int,
+        token_count: int,
+        device: torch.device,
+        require_cls_visible: bool,
     ) -> Optional[Tensor]:
         if mask is None:
             return None
@@ -579,7 +652,7 @@ class PretrainVideoMamba(nn.Module):
             raise ValueError(
                 f"mask token length mismatch: expected {token_count}, got {mask.shape[1]}."
             )
-        if token_count > 0 and torch.any(mask[:, 0]):
+        if require_cls_visible and token_count > 0 and torch.any(mask[:, 0]):
             raise ValueError("mask must keep CLS token visible (mask[:, 0] must be False).")
         return mask
 
@@ -588,6 +661,8 @@ class PretrainVideoMamba(nn.Module):
         patch_tokens: Tensor,
         visible_positions: Tensor,
         temporal_tokens: int,
+        tokens_per_frame: int,
+        has_cls_token: bool,
     ) -> Tensor:
         """Average visible patch tokens per temporal slice under arbitrary masking."""
         if patch_tokens.ndim != 3:
@@ -596,15 +671,15 @@ class PretrainVideoMamba(nn.Module):
             raise ValueError("visible_positions must have shape [B, N_total_visible].")
         if patch_tokens.shape[0] != visible_positions.shape[0]:
             raise ValueError("Batch size mismatch between patch_tokens and visible_positions.")
-        if visible_positions.shape[1] != patch_tokens.shape[1] + 1:
-            raise ValueError(
-                "visible_positions must include one CLS position in addition to patch tokens."
-            )
-        if visible_positions.numel() > 0 and not torch.all(visible_positions[:, 0] == 0):
+        expected = patch_tokens.shape[1] + (1 if has_cls_token else 0)
+        if visible_positions.shape[1] != expected:
+            raise ValueError("visible_positions and patch_tokens lengths are inconsistent.")
+        if has_cls_token and visible_positions.numel() > 0 and not torch.all(
+            visible_positions[:, 0] == 0
+        ):
             raise ValueError("mask must keep CLS token visible for temporal pooling.")
 
-        tokens_per_frame = self.patch_embed.num_patches
-        patch_positions = visible_positions[:, 1:] - 1
+        patch_positions = visible_positions[:, 1:] - 1 if has_cls_token else visible_positions
         frame_indices = torch.div(
             patch_positions, tokens_per_frame, rounding_mode="floor"
         ).to(dtype=torch.long)
@@ -633,10 +708,17 @@ class PretrainVideoMamba(nn.Module):
         return temporal_sum / temporal_counts
 
     def _visible_token_positions(
-        self, mask: Optional[Tensor], batch_size: int, token_count: int, device: torch.device
+        self,
+        mask: Optional[Tensor],
+        batch_size: int,
+        token_count: int,
+        device: torch.device,
+        require_cls_visible: bool,
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         """Normalize mask and return visible token indices per sample."""
-        normalized_mask = self._normalize_mask(mask, batch_size, token_count, device)
+        normalized_mask = self._normalize_mask(
+            mask, batch_size, token_count, device, require_cls_visible=require_cls_visible
+        )
         if normalized_mask is None:
             return None, None
 
@@ -680,37 +762,31 @@ class PretrainVideoMamba(nn.Module):
         self._validate_temporal_length(x.shape[2])
         x = self.patch_embed(x)
         B, C, T, H, W = x.shape
+        spatial_pos = self._get_spatial_pos_embedding(H, W, dtype=x.dtype, device=x.device)
+        temporal_pos_embed = self._get_temporal_pos_embedding(
+            T, offset=temporal_pos_offset, dtype=x.dtype, device=x.device
+        )
+        patch_tokens = x.permute(0, 2, 3, 4, 1).reshape(B, T, H * W, C)
+        patch_tokens = patch_tokens + spatial_pos.unsqueeze(1)
+        patch_tokens = patch_tokens + temporal_pos_embed.unsqueeze(2)
+        patch_tokens = patch_tokens.reshape(B, T * H * W, C)
 
-        if use_image:
-            x = x.permute(0, 2, 3, 4, 1).reshape(B, T * H * W, C)
+        has_cls_token = self._has_cls_token_for_forward(ssm_state, temporal_pos_offset)
+        if has_cls_token:
             cls_token = self.cls_token.expand(B, -1, -1)
-            x = torch.cat((cls_token, x), dim=1)
-            cls_pos = self.pos_embed[:, :1]
-            spatial_pos = self.pos_embed[:, 1:].repeat(1, T, 1)
-            x = x + torch.cat((cls_pos, spatial_pos), dim=1)
+            cls_pos = self.pos_embed[:, :1].to(device=x.device, dtype=x.dtype)
+            x = torch.cat((cls_token + cls_pos, patch_tokens), dim=1)
         else:
-            x = x.permute(0, 2, 3, 4, 1).reshape(B * T, H * W, C)
-            cls_token = self.cls_token.expand(
-                x.shape[0], -1, -1
-            )  # stole cls_tokens impl from Phil Wang, thanks
-            x = torch.cat((cls_token, x), dim=1)
-            x = x + self.pos_embed
-            # temporal pos
-            cls_tokens = x[:B, :1, :]
-            x = x[:, 1:]
-            x = rearrange(x, "(b t) n m -> (b n) t m", b=B, t=T)
-            temporal_pos_embed = self._get_temporal_pos_embedding(
-                T,
-                offset=temporal_pos_offset,
-                dtype=x.dtype,
-                device=x.device,
-            )
-            x = x + temporal_pos_embed
-            x = rearrange(x, "(b n) t m -> b (t n) m", b=B, t=T)
-            x = torch.cat((cls_tokens, x), dim=1)
+            x = patch_tokens
 
         # mask
-        mask, visible_positions = self._visible_token_positions(mask, B, x.shape[1], x.device)
+        mask, visible_positions = self._visible_token_positions(
+            mask,
+            B,
+            x.shape[1],
+            x.device,
+            require_cls_visible=has_cls_token,
+        )
         if visible_positions is not None:
             x_vis = x.gather(1, visible_positions.unsqueeze(-1).expand(-1, -1, C))
         else:
@@ -843,7 +919,10 @@ class PretrainVideoMamba(nn.Module):
         """
         if x.ndim != 5:
             raise ValueError("x must have shape [B, C, T, H, W].")
+        spatial_grid_h, spatial_grid_w = self._spatial_token_grid(x.shape[-2], x.shape[-1])
+        spatial_tokens_per_frame = spatial_grid_h * spatial_grid_w
         temporal_tokens = self._validate_temporal_length(x.shape[2])
+        has_cls_token = self._has_cls_token_for_forward(ssm_state, temporal_pos_offset)
         features = self.forward_features(
             x,
             mask,
@@ -859,45 +938,57 @@ class PretrainVideoMamba(nn.Module):
             )
 
         if self.add_pool_norm:
-            x_vis_cls, x_vis = x_vis[:, :1], x_vis[:, 1:]
-            if self.pool_type != "cls" and x_vis.shape[1] == 0:
+            cls_token = x_vis[:, :1] if has_cls_token else None
+            patch_tokens = x_vis[:, 1:] if has_cls_token else x_vis
+            cls_required = self.pool_type in {"cls", "cls+avg", "cls_cat_avg"}
+            if cls_required and cls_token is None:
+                raise ValueError(
+                    f"pool_type='{self.pool_type}' requires a CLS token, but continuation "
+                    "streaming chunks (temporal_pos_offset > 0 with full state) do not include CLS. "
+                    "Use pool_type='avg' for chunked streaming."
+                )
+            if self.pool_type != "cls" and patch_tokens.shape[1] == 0:
                 raise ValueError(
                     "mask must keep at least one patch token visible when using "
                     f"pool_type='{self.pool_type}'."
                 )
-            if (
-                keep_temporal
-                and ssm_state is not None
-                and temporal_pos_offset > 0
-                and self.pool_type in {"cls+avg", "cls_cat_avg"}
-            ):
-                raise ValueError(
-                    "keep_temporal with streaming state only supports pool_type='avg'; "
-                    "CLS-based temporal pooling is chunk-boundary dependent."
-                )
             if self.pool_type == "cls":  # only return cls token
-                x_pool_vis = self.pool_norm(x_vis_cls)
+                assert cls_token is not None
+                x_pool_vis = self.pool_norm(cls_token)
             else:
                 if keep_temporal:
-                    B, _, C_hidden = x_vis.shape
+                    B, _, C_hidden = patch_tokens.shape
                     if mask is None:
-                        temporal_avg = x_vis.view(B, temporal_tokens, -1, C_hidden).mean(2)
+                        temporal_avg = patch_tokens.view(
+                            B, temporal_tokens, spatial_tokens_per_frame, C_hidden
+                        ).mean(2)
                     else:
-                        full_token_count = 1 + temporal_tokens * self.patch_embed.num_patches
+                        full_token_count = (
+                            (1 if has_cls_token else 0)
+                            + temporal_tokens * spatial_tokens_per_frame
+                        )
                         _, visible_positions = self._visible_token_positions(
-                            mask, B, full_token_count, x.device
+                            mask,
+                            B,
+                            full_token_count,
+                            x.device,
+                            require_cls_visible=has_cls_token,
                         )
                         assert visible_positions is not None
                         temporal_avg = self._masked_temporal_average(
-                            x_vis,
+                            patch_tokens,
                             visible_positions,
                             temporal_tokens,
+                            spatial_tokens_per_frame,
+                            has_cls_token,
                         )
                     if self.pool_type == "cls+avg":
-                        x_pool_vis = self.pool_norm(x_vis_cls + temporal_avg)
+                        assert cls_token is not None
+                        x_pool_vis = self.pool_norm(cls_token + temporal_avg)
                     elif self.pool_type == "cls_cat_avg":
+                        assert cls_token is not None
                         x_pool_vis = self.pool_norm(
-                            torch.cat([x_vis_cls, temporal_avg], dim=1)
+                            torch.cat([cls_token, temporal_avg], dim=1)
                         )
                     elif self.pool_type == "avg":
                         x_pool_vis = self.pool_norm(temporal_avg)
@@ -905,17 +996,24 @@ class PretrainVideoMamba(nn.Module):
                         raise ValueError(f"Unsupported pool_type: {self.pool_type}")
                 else:
                     if self.pool_type == "cls+avg":
+                        assert cls_token is not None
                         x_pool_vis = self.pool_norm(
-                            x_vis_cls + x_vis.mean(1, keepdim=True)
+                            cls_token + patch_tokens.mean(1, keepdim=True)
                         )
                     elif self.pool_type == "cls_cat_avg":
+                        assert cls_token is not None
                         x_pool_vis = self.pool_norm(
-                            torch.cat([x_vis_cls, x_vis.mean(1, keepdim=True)], dim=1)
+                            torch.cat(
+                                [cls_token, patch_tokens.mean(1, keepdim=True)],
+                                dim=1,
+                            )
                         )
                     elif self.pool_type == "avg":
-                        x_pool_vis = self.pool_norm(x_vis.mean(1, keepdim=True))
+                        x_pool_vis = self.pool_norm(patch_tokens.mean(1, keepdim=True))
                     else:
                         raise ValueError(f"Unsupported pool_type: {self.pool_type}")
+
+            x_vis = patch_tokens
 
             if ssm_state is None:
                 return x_vis, x_pool_vis
@@ -954,31 +1052,6 @@ def load_state_dict(pretrained_path, model, ckpt_num_frame, num_frames):
             "Model patch grid size mismatch: "
             f"{new_grid_h}x{new_grid_w} != num_patches({num_patches})."
         )
-
-    def _infer_spatial_grid(
-        token_count: int, reference_grid: Tuple[int, int]
-    ) -> Tuple[int, int]:
-        if token_count <= 0:
-            raise ValueError("Position embedding must contain at least one spatial token.")
-        ref_h, ref_w = reference_grid
-        ref_ratio = float(ref_h) / float(ref_w)
-        best_hw: Optional[Tuple[int, int]] = None
-        best_score: Optional[Tuple[float, int]] = None
-        for h in range(1, int(math.sqrt(token_count)) + 1):
-            if token_count % h != 0:
-                continue
-            w = token_count // h
-            for hh, ww in ((h, w), (w, h)):
-                score = (
-                    abs((float(hh) / float(ww)) - ref_ratio),
-                    abs(hh - ref_h) + abs(ww - ref_w),
-                )
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_hw = (hh, ww)
-        if best_hw is None:
-            raise ValueError(f"Unable to infer spatial grid from token count {token_count}.")
-        return best_hw
 
     orig_grid_h, orig_grid_w = _infer_spatial_grid(
         orig_token_count, (new_grid_h, new_grid_w)

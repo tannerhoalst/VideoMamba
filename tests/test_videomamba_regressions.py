@@ -205,6 +205,30 @@ def test_setup_deepspeed_config_uses_world_size_one_without_dist_init(tmp_path):
     assert ds_config["train_micro_batch_size_per_gpu"] == 4
 
 
+def test_setup_deepspeed_config_accepts_bf16_without_fp16(tmp_path):
+    config = SimpleNamespace(
+        output_dir=str(tmp_path / "ds_cfg_bf16"),
+        batch_size=4,
+        optimizer=SimpleNamespace(
+            lr=1e-4,
+            weight_decay=0.01,
+            opt_betas=(0.9, 0.999),
+        ),
+        deepspeed=SimpleNamespace(stage=1, enable=True),
+        fp16=False,
+        bf16=True,
+    )
+    config.get = lambda key, default=None: getattr(config, key, default)
+
+    setup_deepspeed_config(config)
+
+    with open(config.deepspeed_config, "r") as f:
+        ds_config = json.load(f)
+    assert ds_config["zero_optimization"]["stage"] == 1
+    assert ds_config["bf16"]["enabled"] is True
+    assert "fp16" not in ds_config
+
+
 def test_config_from_file_python_module_cache_does_not_collide(tmp_path):
     cfg_a_dir = tmp_path / "a"
     cfg_b_dir = tmp_path / "b"
@@ -258,6 +282,11 @@ def test_forward_features_returns_state_when_requested():
     assert x_vis.shape[0] == 1
     assert isinstance(next_state, list)
     assert len(next_state) == model.depth
+
+
+def test_no_weight_decay_includes_temporal_pos_embedding():
+    model = _small_model()
+    assert "temporal_pos_embedding" in model.no_weight_decay()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
@@ -392,6 +421,17 @@ def test_use_image_multiframe_masked_path_keeps_batch_dimension():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_use_image_temporal_pos_offset_changes_outputs_when_temporal_embedding_is_nonzero():
+    model = _small_model(num_frames=8, add_pool_norm=False).cuda().eval()
+    x = torch.randn(1, 3, 4, 8, 8, device="cuda")
+    with torch.no_grad():
+        model.temporal_pos_embedding.copy_(torch.randn_like(model.temporal_pos_embedding))
+        out_a = model.forward_features(x, use_image=True, temporal_pos_offset=0)
+        out_b = model.forward_features(x, use_image=True, temporal_pos_offset=2)
+    assert not torch.allclose(out_a, out_b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
 def test_masked_forward_rejects_variable_visible_token_counts():
     model = _small_model().cuda().eval()
     x = torch.randn(2, 3, 4, 8, 8, device="cuda")
@@ -416,6 +456,16 @@ def test_use_image_mask_length_uses_post_tubelet_temporal_tokens():
         x_vis, x_pool = model(x, mask=mask, use_image=True)
 
     assert x_vis.shape == (1, temporal_tokens * model.patch_embed.num_patches, model.embed_dim)
+    assert x_pool.shape == (1, 1, model.embed_dim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_forward_supports_runtime_non_square_resolution_with_spatial_pos_interpolation():
+    model = _small_model(img_size=8).cuda().eval()
+    x = torch.randn(1, 3, 4, 12, 8, device="cuda")
+    with torch.no_grad():
+        x_vis, x_pool = model(x, mask=None, use_image=False)
+    assert x_vis.shape == (1, 4 * 3 * 2, model.embed_dim)
     assert x_pool.shape == (1, 1, model.embed_dim)
 
 
@@ -472,7 +522,7 @@ def test_keep_temporal_streaming_rejects_cls_based_pooling_after_first_chunk(poo
     x = torch.randn(1, 3, 2, 8, 8, device="cuda")
     state = model.init_state(batch_size=1, dtype=x.dtype, device=x.device)
 
-    with pytest.raises(ValueError, match="only supports pool_type='avg'"):
+    with pytest.raises(ValueError, match="requires a CLS token"):
         model(
             x,
             mask=None,
@@ -481,3 +531,58 @@ def test_keep_temporal_streaming_rejects_cls_based_pooling_after_first_chunk(poo
             ssm_state=state,
             temporal_pos_offset=1,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_streaming_continuation_chunk_omits_cls_token_with_full_state():
+    model = _small_model(add_pool_norm=False).cuda().eval()
+    x = torch.randn(1, 3, 4, 8, 8, device="cuda")
+    state = model.init_state(batch_size=1, dtype=x.dtype, device=x.device)
+
+    with torch.no_grad():
+        first_chunk, state = model(
+            x[:, :, :2],
+            mask=None,
+            use_image=False,
+            ssm_state=state,
+            temporal_pos_offset=0,
+        )
+        second_chunk, _ = model(
+            x[:, :, 2:],
+            mask=None,
+            use_image=False,
+            ssm_state=state,
+            temporal_pos_offset=2,
+        )
+
+    assert first_chunk.shape[1] == 1 + 2 * 2 * 2
+    assert second_chunk.shape[1] == 2 * 2 * 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required by causal-conv1d")
+def test_streaming_chunked_full_state_matches_full_sequence_features():
+    model = _small_model(add_pool_norm=False).cuda().eval()
+    x = torch.randn(1, 3, 8, 8, 8, device="cuda")
+
+    with torch.no_grad():
+        full = model(x, mask=None, use_image=False)
+
+    state = model.init_state(batch_size=1, dtype=x.dtype, device=x.device)
+    with torch.no_grad():
+        first_chunk, state = model(
+            x[:, :, :4],
+            mask=None,
+            use_image=False,
+            ssm_state=state,
+            temporal_pos_offset=0,
+        )
+        second_chunk, _ = model(
+            x[:, :, 4:],
+            mask=None,
+            use_image=False,
+            ssm_state=state,
+            temporal_pos_offset=4,
+        )
+
+    stitched = torch.cat([first_chunk, second_chunk], dim=1)
+    torch.testing.assert_close(stitched, full, rtol=1e-2, atol=1e-2)

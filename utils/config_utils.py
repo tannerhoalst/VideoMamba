@@ -127,20 +127,21 @@ def setup_deepspeed_config(config):
                 config.deepspeed.stage
             )
 
-        if config.fp16:
-            if config.get("bf16", True):
-                ds_config["bf16"] = {"enabled": True}
-            else:
-                ds_config["fp16"] = {
-                    "enabled": True,
-                    "auto_cast": False,
-                    "loss_scale": 0,
-                    "initial_scale_power": 16,
-                    "loss_scale_window": 1000,
-                    "hysteresis": 2,
-                    "consecutive_hysteresis": False,
-                    "min_loss_scale": 1,
-                }
+        use_fp16 = bool(config.get("fp16", False))
+        use_bf16 = bool(config.get("bf16", False))
+        if use_bf16:
+            ds_config["bf16"] = {"enabled": True}
+        elif use_fp16:
+            ds_config["fp16"] = {
+                "enabled": True,
+                "auto_cast": False,
+                "loss_scale": 0,
+                "initial_scale_power": 16,
+                "loss_scale_window": 1000,
+                "hysteresis": 2,
+                "consecutive_hysteresis": False,
+                "min_loss_scale": 1,
+            }
         else:
             assert (
                 config.deepspeed.stage == 0

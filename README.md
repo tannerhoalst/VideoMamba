@@ -60,6 +60,10 @@ For feature-only output:
 - `forward_features(...) -> x_vis`
 - `forward_features(..., ssm_state=state) -> (x_vis, next_state)`
 
+Streaming note:
+- For continuation chunks (`ssm_state` from `init_state` and `temporal_pos_offset > 0`), CLS is not re-inserted.
+- This keeps chunked execution behavior aligned with full-sequence execution.
+
 ## Checkpoint Contract
 
 - `vision_encoder.channels` is required (no `in_chans` fallback).
@@ -87,7 +91,7 @@ State shapes (per layer):
 - `ssm_state`: `(B, D_inner, d_state)`
 
 Note: when using streaming with `keep_temporal=True` on non-initial chunks (`temporal_pos_offset > 0`),
-`pool_type='avg'` is supported. CLS-based temporal pooling is chunk-boundary dependent.
+`pool_type='avg'` is supported. CLS-based pooling requires a CLS token and is not available for continuation chunks.
 
 ## Performance Notes
 
