@@ -273,8 +273,10 @@ def create_block(
         factory_kwargs["dtype"] = dtype
     if ssm_cfg is None:
         ssm_cfg = {}
+    # Force unidirectional blocks so bidirectional behavior can be composed externally
+    # (e.g. gated forward/backward fusion wrappers).
     mixer_cls = partial(
-        Mamba, layer_idx=layer_idx, bimamba=bimamba, **ssm_cfg, **factory_kwargs
+        Mamba, layer_idx=layer_idx, bimamba=False, **ssm_cfg, **factory_kwargs
     )
     norm_cls = partial(nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon)
     block = Block(

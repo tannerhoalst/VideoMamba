@@ -12,6 +12,7 @@ from models.videomamba.streaming import (
     validate_state,
 )
 from models.videomamba.videomamba import PretrainVideoMamba
+from models.refiner_backbone import BiMambaRefinerBlock
 
 from .determinism import (
     DeterminismConfig,
@@ -24,6 +25,7 @@ __all__ = [
     "DeterminismConfig",
     "ForwardReturnSemantics",
     "LayerState",
+    "BiMambaRefinerBlock",
     "PretrainVideoMamba",
     "STREAMING_CONTRACT_VERSION",
     "StateShape",
