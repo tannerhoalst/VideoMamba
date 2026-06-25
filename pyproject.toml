@@ -9,12 +9,12 @@ description = "VideoMamba backbone utility for video applications with Mamba sta
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
-    "torch @ https://pytorch.org",
-    "timm @ git+https://github.com",
-    "numpy @ git+https://github.com",
-    "einops @ git+https://github.com",
-    "mamba-ssm @ git+https://github.com",
-    "causal-conv1d @ git+https://github.com",
+    "torch>=2.4,<2.12",
+    "timm>=1.0.22",
+    "numpy>=2.4.0",
+    "einops>=0.6",
+    "mamba-ssm==2.3.2.post1",
+    "causal-conv1d==1.6.2.post1",
 ]
 
 [project.optional-dependencies]
