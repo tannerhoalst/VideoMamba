@@ -13,8 +13,8 @@ dependencies = [
     "timm>=1.0.22",
     "numpy>=2.4.0",
     "einops>=0.6",
-    "mamba-ssm==2.2.6.post3",
-    "causal-conv1d==1.5.4",
+    "mamba-ssm==2.3.2.post1",
+    "causal-conv1d==1.6.2.post1",
 ]
 
 [project.optional-dependencies]
